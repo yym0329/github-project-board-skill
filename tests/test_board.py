@@ -4,6 +4,8 @@ Run from the repository root:
     python3 -m unittest discover -s tests -v
 """
 
+import contextlib
+import io
 import json
 import pathlib
 import subprocess
@@ -39,59 +41,123 @@ FIELDS = [
     {"id": "F_ASSIGN", "name": "Assignees", "dataType": "ASSIGNEES"},
 ]
 
-ITEMS = [
-    {"id": "PVTI_a", "title": "Fix login bug", "status": "Backlog",
-     "content": {"type": "Issue", "number": 12, "title": "Fix login bug"}},
-    {"id": "PVTI_b", "title": "Fix login bug 2", "status": "Done",
-     "content": {"type": "Issue", "number": 13, "title": "Fix login bug 2"}},
-    {"id": "PVTI_c", "title": "Write release notes", "status": "In progress",
-     "content": {"type": "DraftIssue", "id": "DI_c",
-                 "title": "Write release notes"}},
-    {"id": "PVTI_d", "title": "Release checklist", "status": None,
-     "content": {"type": "DraftIssue", "id": "DI_d",
-                 "title": "Release checklist"}},
+
+def node(item_id, title, status=None, number=None, archived=False,
+         values=None, body="", stage=None, assignees=()):
+    """Builds a ProjectV2Item node shaped like the GraphQL response."""
+    field_values = [{"text": title, "field": {"name": "Title"}}, {}]
+    if status:
+        field_values.append({"name": status, "field": {"name": "Status"}})
+    if stage:
+        field_values.append({"name": stage, "field": {"name": "Stage"}})
+    for name, value in (values or {}).items():
+        key = {"Estimate": "number", "Target date": "date",
+               "Sprint": "title"}.get(name, "text")
+        field_values.append({key: value, "field": {"name": name}})
+    if number is None:
+        content = {"__typename": "DraftIssue", "id": "DI_" + item_id[5:],
+                   "title": title, "body": body}
+    else:
+        content = {"__typename": "Issue", "id": "I_" + item_id[5:],
+                   "title": title, "body": body, "number": number,
+                   "url": f"https://github.com/octo/app/issues/{number}",
+                   "assignees": {"nodes": [{"login": a} for a in assignees]}}
+    return {"id": item_id, "isArchived": archived,
+            "fieldValues": {"nodes": field_values}, "content": content}
+
+
+NODES = [
+    node("PVTI_d", "Release checklist"),
+    node("PVTI_b", "Fix login bug 2", "Done", 13),
+    node("PVTI_a", "Fix login bug", "Backlog", 12, body="Goal: fix it.",
+         values={"Estimate": 3, "Target date": "2026-12-01"},
+         assignees=["ann"]),
+    node("PVTI_c", "Write release notes", "In progress", body="Draft body"),
+    node("PVTI_e", "2026", "Backlog"),
+    node("PVTI_f", "Old release plan", "Done", 14, archived=True),
+    node("PVTI_g", "Stale idea", archived=True),
 ]
 
 
 class FakeGh:
-    """Records gh calls and answers the few the board makes."""
+    """Records gh calls and answers the ones the board makes."""
 
-    def __init__(self, items=None, project_owner_type="User"):
+    def __init__(self, nodes=None, page=3):
         self.calls = []
-        self.items = ITEMS if items is None else items
-        self.project_owner_type = project_owner_type
+        self.nodes = NODES if nodes is None else nodes
+        self.page = page
 
     def __call__(self, *args, stdin=None):
         self.calls.append((args, stdin))
         if args[:2] == ("api", "graphql") and stdin is None:
-            query = next(a for a in args if a.startswith("query="))
+            query = next(a[6:] for a in args if a.startswith("query="))
+            variables = dict(a.split("=", 1) for a in args[3:]
+                             if not a.startswith("-") and "=" in a
+                             and not a.startswith("query="))
+            if "items(first" in query:
+                return self._page(variables)
             if "repositoryOwner" in query:
-                project = {"id": "PVT_1", "fields": {"nodes": FIELDS}}
-                return json.dumps({"data": {"repositoryOwner": {
-                    "projectV2": project}}})
+                return json.dumps({"data": {"repositoryOwner": {"projectV2": {
+                    "id": "PVT_1", "fields": {"nodes": FIELDS}}}}})
             if "node(id:" in query:
-                return json.dumps({"data": {"node": {
-                    "id": "PVTI_z", "status": {"name": "Done"},
-                    "content": {"__typename": "Issue", "id": "I_z",
-                                "title": "From node", "number": 99}}}})
+                found = next((n for n in self.nodes
+                              if n["id"] == variables["id"]), None)
+                return json.dumps({"data": {"node": found}})
         if args[:2] == ("api", "graphql"):
             return json.dumps({"data": {}})
-        if args[:2] == ("project", "item-list"):
-            return json.dumps({"items": self.items,
-                               "totalCount": len(self.items)})
-        return "{}"
+        if args[:2] == ("issue", "create"):
+            return "https://github.com/octo/app/issues/99\n"
+        if args[:2] in (("project", "item-create"), ("project", "item-add")):
+            return json.dumps({"id": "PVTI_new"})
+        return ""
+
+    def _page(self, variables):
+        cursor = variables.get("cursor", "null")
+        start = 0 if cursor == "null" else int(cursor)
+        chunk = self.nodes[start:start + self.page]
+        more = start + self.page < len(self.nodes)
+        status = variables["status"]
+        options = next((f["options"] for f in FIELDS
+                        if f["name"].lower() == status.lower()), [])
+        project = {"field": {"options": [{"name": o["name"]}
+                                         for o in options]},
+                   "items": {"nodes": chunk, "pageInfo": {
+                       "hasNextPage": more,
+                       "endCursor": str(start + self.page)}}}
+        return json.dumps({"data": {"repositoryOwner": {
+            "projectV2": project}}})
 
     def by_prefix(self, *prefix):
         return [a for a, _ in self.calls if a[:len(prefix)] == prefix]
 
+    def graphql_queries(self):
+        return [next(a for a in args if a.startswith("query="))
+                for args in self.by_prefix("api", "graphql")
+                if any(a.startswith("query=") for a in args)]
 
-def make_board(status_field="Status", items=None):
-    fake = FakeGh(items=items)
-    patcher = mock.patch.object(board, "gh", fake)
-    patcher.start()
-    config = board.Config(owner="octo", number=7, repo="octo/app",
-                          status_field=status_field)
-    return board.Board(config), fake, patcher
+
+class BoardTestCase(unittest.TestCase):
+    """Sets up a Board for octo/7 with a fake gh."""
+
+    status_field = "Status"
+    repo = "octo/app"
+
+    def setUp(self):
+        self.fake = FakeGh()
+        patcher = mock.patch.object(board, "gh", self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.board = board.Board(board.Config(
+            owner="octo", number=7, repo=self.repo,
+            status_field=self.status_field))
+
+    def run_cmd(self, argv):
+        """Runs one subcommand and returns what it printed."""
+        args = board.build_parser().parse_args(argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            getattr(board, f"cmd_{args.cmd}")(self.board, args)
+        return out.getvalue()
 
 
 class ConfigTest(unittest.TestCase):
@@ -111,60 +177,71 @@ class ConfigTest(unittest.TestCase):
         self.write(self.home / ".config" / "project-board" / "config.json",
                    data)
 
-    def load(self, flags=None, env=None, cwd=None):
-        return board.load_config(flags or {}, env or {}, cwd or self.deep,
-                                 self.home)
+    def load(self, flags=None, env=None):
+        return board.load_config(flags or {}, env or {}, self.deep, self.home)
 
-    def test_precedence_key_by_key(self):
-        self.user_file({"owner": "user-o", "number": 1, "repo": "u/r",
-                        "status_field": "UserStage"})
-        self.write(self.root / ".project-board.json",
-                   {"owner": "far-o", "number": 2, "repo": "far/r"})
-        self.write(self.root / "a" / ".project-board.json",
-                   {"owner": "near-o", "number": 3})
-        env = {"PROJECT_BOARD_NUMBER": "4", "PROJECT_BOARD_REPO": "",
-               "PROJECT_BOARD_STATUS_FIELD": None}
-        cfg = self.load(flags={"owner": "flag-o", "number": None}, env=env)
-        self.assertEqual(cfg.owner, "flag-o")          # flag
-        self.assertEqual(cfg.number, 4)                # env beats files
-        # The nearest file has no repo, and an empty env var does not count;
-        # the user file supplies it, not the farther project file.
-        self.assertEqual(cfg.repo, "u/r")
-        self.assertEqual(cfg.status_field, "UserStage")
-
-    def test_flag_beats_env(self):
+    def test_flags_beat_everything(self):
+        self.user_file({"owner": "user", "number": 1})
+        self.write(self.deep / ".project-board.json",
+                   {"owner": "file", "number": 2})
         cfg = self.load(flags={"owner": "f", "number": 5},
                         env={"PROJECT_BOARD_OWNER": "e",
                              "PROJECT_BOARD_NUMBER": "6"})
-        self.assertEqual((cfg.owner, cfg.number), ("f", 5))
+        self.assertEqual((cfg.owner, cfg.number, cfg.source),
+                         ("f", 5, "flags"))
 
-    def test_env_beats_project_file(self):
-        self.write(self.root / ".project-board.json",
+    def test_env_beats_files(self):
+        self.write(self.deep / ".project-board.json",
                    {"owner": "file", "number": 2})
-        cfg = self.load(env={"PROJECT_BOARD_OWNER": "env"})
-        self.assertEqual((cfg.owner, cfg.number), ("env", 2))
+        cfg = self.load(env={"PROJECT_BOARD_OWNER": "env",
+                             "PROJECT_BOARD_NUMBER": "4",
+                             "PROJECT_BOARD_REPO": ""})
+        self.assertEqual((cfg.owner, cfg.number), ("env", 4))
 
     def test_nearest_project_file_beats_farther_and_user(self):
         self.user_file({"owner": "user", "number": 1})
         self.write(self.root / ".project-board.json",
                    {"owner": "far", "number": 2})
-        self.write(self.deep / ".project-board.json",
+        self.write(self.root / "a" / ".project-board.json",
                    {"owner": "near", "number": 3})
         cfg = self.load()
         self.assertEqual((cfg.owner, cfg.number), ("near", 3))
         self.assertEqual(cfg.status_field, "Status")
 
     def test_user_file_used_when_nothing_else(self):
-        self.user_file({"owner": "user", "number": "8"})
+        self.user_file({"owner": "user", "number": "8", "repo": "u/r"})
         cfg = self.load()
         self.assertEqual((cfg.owner, cfg.number, cfg.repo),
-                         ("user", 8, None))
+                         ("user", 8, "u/r"))
+
+    def test_keys_are_not_mixed_across_sources(self):
+        self.write(self.deep / ".project-board.json",
+                   {"owner": "file", "number": 2, "repo": "file/r",
+                    "status_field": "Stage"})
+        cfg = self.load(flags={"owner": "other-org", "number": 9})
+        self.assertIsNone(cfg.repo)
+        self.assertEqual(cfg.status_field, "Status")
+
+    def test_partial_source_is_an_error(self):
+        self.write(self.deep / ".project-board.json",
+                   {"owner": "file", "number": 2})
+        with self.assertRaises(board.BoardError) as ctx:
+            self.load(flags={"owner": "other-org"})
+        self.assertIn("--number", str(ctx.exception))
+        with self.assertRaises(board.BoardError) as ctx:
+            self.load(env={"PROJECT_BOARD_NUMBER": "3"})
+        self.assertIn("PROJECT_BOARD_OWNER", str(ctx.exception))
+        with self.assertRaises(board.BoardError):
+            self.load(flags={"repo": "x/y"})
+        self.write(self.deep / ".project-board.json", {"owner": "file"})
+        self.user_file({"owner": "user", "number": 1})
+        with self.assertRaises(board.BoardError):
+            self.load()
 
     def test_missing_config_names_every_option(self):
         with self.assertRaises(board.BoardError) as ctx:
-            self.load(env={"PROJECT_BOARD_OWNER": "only-owner"})
+            self.load()
         msg = str(ctx.exception)
-        self.assertIn("missing: number", msg)
         for hint in ("--owner", "--number", "PROJECT_BOARD_OWNER",
                      "PROJECT_BOARD_NUMBER", ".project-board.json",
                      "~/.config/project-board/config.json", "init"):
@@ -183,7 +260,7 @@ class ConfigTest(unittest.TestCase):
             ["init", "acme", "3", "--repo", "acme/web"])
         with mock.patch.object(board.pathlib.Path, "cwd",
                                return_value=self.deep), \
-                mock.patch("sys.stdout"):
+                contextlib.redirect_stdout(io.StringIO()):
             board.cmd_init(args)
             with self.assertRaises(board.BoardError):
                 board.cmd_init(args)          # refuses to overwrite
@@ -192,29 +269,92 @@ class ConfigTest(unittest.TestCase):
                          ("acme", 3, "acme/web"))
 
 
-class ResolveTest(unittest.TestCase):
+class ItemsTest(BoardTestCase):
 
-    def setUp(self):
-        self.board, self.fake, patcher = make_board()
-        self.addCleanup(patcher.stop)
+    def test_archived_items_are_excluded_and_pages_followed(self):
+        ids = [i["id"] for i in self.board.items()]
+        self.assertEqual(ids, ["PVTI_d", "PVTI_b", "PVTI_a", "PVTI_c",
+                               "PVTI_e"])
+        self.assertEqual(len(self.fake.by_prefix("api", "graphql")), 3)
+        self.assertEqual([i["id"] for i in self.board.items(archived=True)],
+                         ["PVTI_f", "PVTI_g"])
 
-    def test_node_id_uses_one_node_query_and_no_listing(self):
-        item = self.board.resolve("PVTI_z")
+    def test_query_uses_owner_union_and_typed_variables(self):
+        self.board.items(query="priority:P0")
+        args = self.fake.by_prefix("api", "graphql")[0]
+        query = next(a for a in args if a.startswith("query="))
+        self.assertIn("repositoryOwner(login: $owner)", query)
+        self.assertIn("... on Organization", query)
+        self.assertIn("query: $q", query)
+        self.assertIn("isArchived", query)
+        self.assertEqual(args[args.index("q=priority:P0") - 1], "-f")
+        self.assertEqual(args[args.index("number=7") - 1], "-F")
+        self.assertEqual(args[args.index("cursor=null") - 1], "-F")
+
+    def test_no_query_variable_without_filter(self):
+        self.board.items()
+        self.assertNotIn("$q", self.fake.graphql_queries()[0])
+
+    def test_list_in_column_order_without_archived(self):
+        lines = self.run_cmd(["list"]).splitlines()
+        self.assertEqual([line.split("[")[-1].rstrip("]") for line in
+                          lines[:-1]],
+                         ["PVTI_a", "PVTI_e", "PVTI_c", "PVTI_b", "PVTI_d"])
+        self.assertIn("#12", lines[0])
+        self.assertIn("@ann", lines[0])
+        self.assertEqual(lines[-1], "5 items")
+
+    def test_list_archived_and_status_filter(self):
+        out = self.run_cmd(["list", "--archived"])
+        self.assertIn("PVTI_f", out)
+        self.assertIn("PVTI_g", out)
+        self.assertNotIn("PVTI_a", out)
+        self.assertIn("2 archived items", out)
+        out = self.run_cmd(["list", "--status", "backlog"])
+        self.assertEqual(out.count("PVTI_"), 2)
+
+
+class CustomStatusFieldTest(BoardTestCase):
+    status_field = "Stage"
+
+    def test_status_read_from_configured_field(self):
+        self.fake.nodes = [node("PVTI_x", "x", status="Done", stage="Shipped")]
+        item = self.board.items()[0]
+        self.assertEqual(item["status"], "Shipped")
+        args = self.fake.by_prefix("api", "graphql")[0]
+        self.assertIn("status=Stage", args)
+
+    def test_move_uses_configured_field_and_prints_canonical_name(self):
+        out = self.run_cmd(["move", "#12", "shipped"])
+        edit = list(self.fake.by_prefix("project", "item-edit")[0])
+        self.assertIn("F_STAGE", edit)
+        self.assertEqual(edit[-2:], ["--single-select-option-id", "s_ship"])
+        self.assertEqual(out.strip(), "Fix login bug: - -> Shipped")
+
+
+class ResolveTest(BoardTestCase):
+
+    def test_node_id_uses_one_query_and_no_listing(self):
+        item = self.board.resolve("PVTI_a")
         self.assertEqual((item["id"], item["title"], item["status"]),
-                         ("PVTI_z", "From node", "Done"))
-        self.assertEqual(item["content"]["type"], "Issue")
+                         ("PVTI_a", "Fix login bug", "Backlog"))
+        self.assertEqual(item["fields"]["Estimate"], 3)
         self.assertEqual(len(self.fake.calls), 1)
-        self.assertEqual(self.fake.by_prefix("project", "item-list"), [])
-        args = self.fake.calls[0][0]
-        self.assertIn("status=Status", args)
+        self.assertNotIn("items(first", self.fake.graphql_queries()[0])
+
+    def test_unknown_node_id(self):
+        with self.assertRaises(board.BoardError):
+            self.board.resolve("PVTI_nope")
 
     def test_number_with_and_without_hash(self):
         self.assertEqual(self.board.resolve("#13")["id"], "PVTI_b")
         self.assertEqual(self.board.resolve("12")["id"], "PVTI_a")
 
+    def test_digit_title_falls_back_to_title_match(self):
+        self.assertEqual(self.board.resolve("2026")["id"], "PVTI_e")
+
     def test_unique_title_substring_case_insensitive(self):
         self.assertEqual(self.board.resolve("NOTES")["id"], "PVTI_c")
-        self.assertEqual(len(self.fake.by_prefix("project", "item-list")), 1)
 
     def test_exact_title_wins_over_substring(self):
         self.assertEqual(self.board.resolve("fix login bug")["id"], "PVTI_a")
@@ -226,26 +366,32 @@ class ResolveTest(unittest.TestCase):
         self.assertIn("2 items match", msg)
         self.assertIn("PVTI_c", msg)
         self.assertIn("PVTI_d", msg)
+        self.assertNotIn("PVTI_f", msg)     # archived
 
-    def test_no_match(self):
-        with self.assertRaises(board.BoardError) as ctx:
-            self.board.resolve("#404")
-        self.assertIn("0 items match", str(ctx.exception))
-
-    def test_list_reads_custom_status_field(self):
-        b, _, patcher = make_board(
-            status_field="Stage",
-            items=[{"id": "PVTI_x", "title": "x", "stage": "Shipped",
-                    "status": "stale"}])
-        self.addCleanup(patcher.stop)
-        self.assertEqual(b.items()[0]["status"], "Shipped")
+    def test_archived_items_not_found_by_title_or_number(self):
+        for ref in ("Old release plan", "#14", "stale"):
+            with self.assertRaises(board.BoardError, msg=ref):
+                self.board.resolve(ref)
+        self.assertEqual(self.board.resolve("old release",
+                                            archived=True)["id"], "PVTI_f")
 
 
-class SetFieldTest(unittest.TestCase):
+class ShowTest(BoardTestCase):
 
-    def setUp(self):
-        self.board, self.fake, patcher = make_board()
-        self.addCleanup(patcher.stop)
+    def test_node_id_and_title_print_the_same(self):
+        by_id = self.run_cmd(["show", "PVTI_a"])
+        by_title = self.run_cmd(["show", "Fix login bug"])
+        self.assertEqual(by_id, by_title)
+        summary = json.loads(by_id.split("\n}\n")[0] + "\n}")
+        self.assertEqual(summary["fields"], {"Status": "Backlog",
+                                             "Estimate": 3,
+                                             "Target date": "2026-12-01"})
+        self.assertEqual(summary["assignees"], ["ann"])
+        self.assertIn("https://github.com/octo/app/issues/12", by_id)
+        self.assertTrue(by_id.rstrip().endswith("Goal: fix it."))
+
+
+class SetFieldTest(BoardTestCase):
 
     def edit_args(self):
         calls = self.fake.by_prefix("project", "item-edit")
@@ -257,9 +403,10 @@ class SetFieldTest(unittest.TestCase):
                 "--project-id", "PVT_1", "--field-id", field_id]
 
     def test_single_select_case_insensitive(self):
-        self.board.set_field("PVTI_a", "status", "in PROGRESS")
+        shown = self.board.set_field("PVTI_a", "status", "in PROGRESS")
         self.assertEqual(self.edit_args(), self.base("F_STATUS")
                          + ["--single-select-option-id", "o_doing"])
+        self.assertEqual(shown, "In progress")
 
     def test_number(self):
         self.board.set_field("PVTI_a", "Estimate", "3.5")
@@ -301,51 +448,114 @@ class SetFieldTest(unittest.TestCase):
     def test_project_and_fields_fetched_once(self):
         self.board.set_field("PVTI_a", "Status", "Done")
         self.board.set_field("PVTI_a", "Estimate", "1")
-        graphql = self.fake.by_prefix("api", "graphql")
-        self.assertEqual(len(graphql), 1)
-        query = next(a for a in graphql[0] if a.startswith("query="))
-        self.assertIn("repositoryOwner(login: $owner)", query)
-        self.assertIn("... on User", query)
-        self.assertIn("... on Organization", query)
-        self.assertNotIn("user(login:", query)
-        self.assertIn("number=7", graphql[0])
-        self.assertEqual(graphql[0][graphql[0].index("number=7") - 1], "-F")
+        queries = self.fake.graphql_queries()
+        self.assertEqual(len(queries), 1)
+        self.assertIn("repositoryOwner(login: $owner)", queries[0])
+        self.assertIn("... on User", queries[0])
+        self.assertIn("... on Organization", queries[0])
+        self.assertNotIn("user(login:", queries[0])
 
-    def test_move_uses_configured_status_field(self):
-        b, fake, patcher = make_board(status_field="Stage")
-        self.addCleanup(patcher.stop)
-        args = board.build_parser().parse_args(["move", "#12", "shipped"])
-        with mock.patch("sys.stdout"):
-            board.cmd_move(b, args)
-        edit = list(fake.by_prefix("project", "item-edit")[0])
-        self.assertIn("F_STAGE", edit)
-        self.assertEqual(edit[-2:], ["--single-select-option-id", "s_ship"])
+    def test_move_prints_canonical_option_name(self):
+        out = self.run_cmd(["move", "PVTI_a", "in progress"])
+        self.assertEqual(out.strip(), "Fix login bug: Backlog -> In progress")
 
 
-class OptionsTest(unittest.TestCase):
+class WriteCommandsTest(BoardTestCase):
 
-    def setUp(self):
-        self.board, self.fake, patcher = make_board()
-        self.addCleanup(patcher.stop)
+    def test_edit_targets_draft_content_id_with_given_flags_only(self):
+        self.run_cmd(["edit", "release notes", "--title", "New title"])
+        self.assertEqual(self.fake.by_prefix("project", "item-edit"),
+                         [("project", "item-edit", "--id", "DI_c",
+                           "--title", "New title")])
+        self.fake.calls.clear()
+        self.run_cmd(["edit", "release notes", "--body", ""])
+        self.assertEqual(self.fake.by_prefix("project", "item-edit"),
+                         [("project", "item-edit", "--id", "DI_c",
+                           "--body", "")])
 
-    def run_options(self, argv):
-        args = board.build_parser().parse_args(["options", "Status"] + argv)
-        with mock.patch("sys.stdout"):
-            board.cmd_options(self.board, args)
+    def test_edit_refuses_non_draft_empty_title_and_no_flags(self):
+        for argv in (["edit", "#12", "--title", "X"],
+                     ["edit", "release notes", "--title", ""],
+                     ["edit", "release notes"]):
+            with self.assertRaises(board.BoardError, msg=argv):
+                self.run_cmd(argv)
+        self.assertEqual(self.fake.by_prefix("project", "item-edit"), [])
+
+    def test_create_draft_with_status(self):
+        out = self.run_cmd(["create", "New card", "--body", "Goal: x",
+                            "--status", "done"])
+        self.assertEqual(self.fake.by_prefix("project", "item-create"),
+                         [("project", "item-create", "7", "--owner", "octo",
+                           "--title", "New card", "--body", "Goal: x",
+                           "--format", "json")])
+        edit = self.fake.by_prefix("project", "item-edit")[0]
+        self.assertEqual(edit[3], "PVTI_new")
+        self.assertEqual(edit[-1], "o_done")
+        self.assertEqual(out.strip(), "PVTI_new")
+
+    def test_create_issue_uses_repo_then_adds_url(self):
+        self.run_cmd(["create", "Bug", "--issue"])
+        self.assertEqual(self.fake.by_prefix("issue", "create"),
+                         [("issue", "create", "--repo", "octo/app",
+                           "--title", "Bug", "--body", "")])
+        self.assertEqual(self.fake.by_prefix("project", "item-add"),
+                         [("project", "item-add", "7", "--owner", "octo",
+                           "--url", "https://github.com/octo/app/issues/99",
+                           "--format", "json")])
+        self.assertEqual(self.fake.by_prefix("project", "item-edit"), [])
+
+    def test_archive_and_undo(self):
+        self.run_cmd(["archive", "release notes"])
+        self.run_cmd(["archive", "old release", "--undo"])
+        self.run_cmd(["archive", "PVTI_g", "--undo"])
+        self.assertEqual(self.fake.by_prefix("project", "item-archive"), [
+            ("project", "item-archive", "7", "--owner", "octo",
+             "--id", "PVTI_c"),
+            ("project", "item-archive", "7", "--owner", "octo",
+             "--id", "PVTI_f", "--undo"),
+            ("project", "item-archive", "7", "--owner", "octo",
+             "--id", "PVTI_g", "--undo"),
+        ])
+
+    def test_undo_does_not_match_current_items(self):
+        with self.assertRaises(board.BoardError):
+            self.run_cmd(["archive", "release notes", "--undo"])
+
+    def test_delete(self):
+        out = self.run_cmd(["delete", "#13"])
+        self.assertEqual(self.fake.by_prefix("project", "item-delete"),
+                         [("project", "item-delete", "7", "--owner", "octo",
+                           "--id", "PVTI_b")])
+        self.assertIn("Fix login bug 2", out)
+
+
+class NoRepoTest(BoardTestCase):
+    repo = None
+
+    def test_create_issue_without_repo_fails_before_any_call(self):
+        with self.assertRaises(board.BoardError):
+            self.run_cmd(["create", "Bug", "--issue"])
+        self.assertEqual(self.fake.calls, [])
+
+
+class OptionsTest(BoardTestCase):
 
     def mutations(self):
         return [(a, s) for a, s in self.fake.calls
                 if a[:2] == ("api", "graphql") and s is not None]
 
+    def status(self):
+        return self.board.field("Status")
+
     def test_dry_run_sends_no_mutation(self):
-        self.run_options(["--add", "In review", "--rename", "Done=Shipped"])
+        self.run_cmd(["options", "Status", "--add", "In review",
+                      "--rename", "Done=Shipped"])
         self.assertEqual(self.mutations(), [])
 
     def test_apply_keeps_ids_and_metadata(self):
-        self.run_options(["--add", "In review", "--rename", "Done=Shipped",
-                          "--remove", "Backlog",
-                          "--order", "In review,In progress,Shipped",
-                          "--apply"])
+        self.run_cmd(["options", "Status", "--add", "In review",
+                      "--rename", "Done=Shipped", "--remove", "Backlog",
+                      "--order", "In review,In progress,Shipped", "--apply"])
         (args, stdin), = self.mutations()
         self.assertEqual(args, ("api", "graphql", "--input", "-"))
         payload = json.loads(stdin)
@@ -359,20 +569,43 @@ class OptionsTest(unittest.TestCase):
              "description": ""},
         ])
 
+    def test_rename_onto_existing_name_is_refused(self):
+        with self.assertRaises(board.BoardError):
+            board.plan_options(self.status(), rename=["Backlog=done"])
+        with self.assertRaises(board.BoardError):
+            board.plan_options(self.status(),
+                               rename=["Backlog=Later", "Done=later"])
+        # Freed by an earlier rename, so this one is allowed.
+        opts = board.plan_options(self.status(),
+                                  rename=["Done=Shipped", "Backlog=Done"])
+        self.assertEqual([(o["id"], o["name"]) for o in opts],
+                         [("o_backlog", "Done"), ("o_doing", "In progress"),
+                          ("o_done", "Shipped")])
+
+    def test_order_refuses_duplicates(self):
+        with self.assertRaises(board.BoardError):
+            board.plan_options(self.status(),
+                               order="Backlog,In progress,Done,Done")
+
+    def test_remove_accepts_old_or_new_name_after_rename(self):
+        for name in ("Shipped", "Done"):
+            opts = board.plan_options(self.status(), rename=["Done=Shipped"],
+                                      remove=[name])
+            self.assertEqual([o["id"] for o in opts],
+                             ["o_backlog", "o_doing"])
+
     def test_plan_rejects_bad_requests(self):
-        status = self.board.field("Status")
         for kwargs in ({"rename": ["Nope=X"]}, {"rename": ["Done="]},
                        {"remove": ["Nope"]}, {"add": ["done"]},
                        {"order": "Backlog,Done"}):
             with self.assertRaises(board.BoardError, msg=kwargs):
-                board.plan_options(status, **kwargs)
+                board.plan_options(self.status(), **kwargs)
         with self.assertRaises(board.BoardError):
             board.plan_options(self.board.field("Notes"))
 
     def test_plan_does_not_mutate_cached_field(self):
-        status = self.board.field("Status")
-        board.plan_options(status, rename=["Done=Shipped"])
-        self.assertEqual(status["options"][2]["name"], "Done")
+        board.plan_options(self.status(), rename=["Done=Shipped"])
+        self.assertEqual(self.status()["options"][2]["name"], "Done")
 
 
 class GhHelperTest(unittest.TestCase):

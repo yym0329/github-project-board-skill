@@ -14,25 +14,33 @@ existing `gh` login.
 
 ## Features
 
-- List, show, create, move, edit, archive and delete cards.
+- List, show, create, move, edit, archive and delete cards. `list` shows
+  cards in column order; `list --archived` shows archived cards.
 - Create a card as a draft or as a real issue, or add an existing issue or
   pull request.
 - Set any editable field: single select, text, number, date and iteration.
   An empty value clears the field.
-- Refer to a card by its node ID (`PVTI_...`), its issue number (`#12`), or
-  part of its title.
+- Refer to a card by its node ID (`PVTI_...`), its issue or pull request
+  number (`#12` or `12`), or part of its title. If a number matches no issue
+  or pull request, it is tried as a title, so a card titled "2026" can still
+  be found.
 - Add, rename, remove and reorder the options of a single-select field (for
   example, the board's columns). Cards keep their values when you rename or
   reorder. Nothing changes until you pass `--apply`.
 - Works with projects owned by a user or by an organization.
 - Uses few API calls: it fetches the project's fields once per run and looks
-  up a node ID with one small query.
+  up a node ID with one small query. Archived cards are left out of lists
+  and lookups.
 
 ## Requirements
 
-- [GitHub CLI](https://cli.github.com) 2.40 or newer, logged in with the
-  `project` scope. To add the scope:
-  `gh auth refresh -h github.com -s project`
+- A recent [GitHub CLI](https://cli.github.com) with the `gh project`
+  commands, logged in with the `project` scope. The tool was tested with
+  gh 2.100.0. To add the scope: `gh auth refresh -h github.com -s project`
+- `list --query` uses GitHub's Projects filter through the GraphQL API, not
+  `gh project item-list --query` (which needs gh 2.87 or newer). It works on
+  github.com; on GitHub Enterprise Server it needs a version whose API
+  supports the filter (3.20 or newer, according to the gh help).
 - Python 3.9 or newer. No extra packages are needed.
 
 ## Install
@@ -82,8 +90,8 @@ parent directory. The keys are:
 | `repo` | `OWNER/NAME` repository for `create --issue` (optional) |
 | `status_field` | Single-select field that holds the columns (default `Status`) |
 
-You can also set the board in other ways. When several are set, the first
-one in this list wins, key by key:
+You can also set the board in other ways. The first source in this list
+that sets anything supplies every key; keys are never mixed across sources:
 
 1. Flags before the subcommand: `--owner`, `--number`, `--repo`,
    `--status-field`.
@@ -91,6 +99,11 @@ one in this list wins, key by key:
    `PROJECT_BOARD_REPO`, `PROJECT_BOARD_STATUS_FIELD`.
 3. The nearest `.project-board.json`.
 4. `~/.config/project-board/config.json`, for a board you use everywhere.
+
+A source that sets any key must set both `owner` and `number`. For example,
+`--owner other-org` alone is an error rather than a mix of `other-org` with
+the number from your config file. Likewise `repo` and `status_field` come
+only from the source that gave the owner and number.
 
 ## Usage
 
@@ -112,8 +125,9 @@ python3 $B move "#7" Done
 python3 $B set "pagination" Priority P1
 python3 $B set "pagination" "Target date" 2026-12-01
 python3 $B set "pagination" Estimate ""           # clear a field
-python3 $B archive "pagination"                   # prints the card's PVTI_ ID
-python3 $B archive PVTI_lADOxxxx --undo
+python3 $B archive "pagination"
+python3 $B list --archived                        # archived cards only
+python3 $B archive "pagination" --undo            # restore by title or PVTI_ ID
 python3 $B options Status --rename "Todo=Backlog" --add "In review"   # dry run
 python3 $B options Status --rename "Todo=Backlog" --add "In review" --apply
 python3 $B --owner my-org --number 3 list         # another board, one time
@@ -146,11 +160,11 @@ archived. See `skills/project-board/SKILL.md` for the full text.
 
 - **Views can't be changed.** GitHub has no API for board or table layout,
   grouping or which fields cards show. Change these in the browser.
-- **Archived cards can't be listed.** The API does not return them, so keep
-  the `PVTI_` ID that `archive` prints if you may want to undo it.
-- **Rate limits.** GitHub limits GraphQL API use per hour. Looking up a card
-  by title or number lists the whole board, so for many edits in a row, use
-  node IDs.
+- **Rate limits.** GitHub's GraphQL API allows 5,000 points per hour. A
+  `list`, or a lookup by title or number, reads the whole board and costs
+  about 2 points per 100 cards (measured with a dry run). A lookup by node ID
+  is one small query. For many edits in a row, use the node IDs that `list`
+  prints.
 - **Large boards.** `list` and title lookups read at most 1,000 cards.
 - Fields such as assignees, labels and milestones belong to the issue, not the
   project. Change them with `gh issue edit`.

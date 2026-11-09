@@ -13,21 +13,24 @@ project, field and option ID for you. It needs Python 3.9+ (stdlib only) and
 B="<skill-dir>/board.py"                # the directory holding this SKILL.md
 python3 $B fields                       # fields, types and options
 python3 $B list [--status "In progress"] [--query "priority:P0 -status:Done"]
-python3 $B show <item>                  # fields, URL and body
+python3 $B list --archived              # archived cards only
+python3 $B show <item>                  # all field values, URL and body
 python3 $B create "Title" [--body "..."] [--status Backlog] [--issue]
 python3 $B add <issue-or-PR-URL> [--status "In review"]
 python3 $B move <item> Done
 python3 $B set <item> <Field> <value>   # single select, text, number, date, iteration; '' clears
 python3 $B edit <item> [--title ...] [--body ...]   # drafts only
-python3 $B archive <item>               # prints the PVTI_ ID
-python3 $B archive <PVTI_id> --undo     # archived cards are not listable; keep the ID
+python3 $B archive <item>
+python3 $B archive <item> --undo        # matches archived cards only
 python3 $B delete <item>
 python3 $B options <Field> [--add X] [--rename Old=New] [--remove X] [--order A,B,C] [--apply]
 ```
 
-`<item>` is a `PVTI_...` node ID, an issue or PR number (`#12`), or a title
-substring that matches exactly one card (an exact title match wins). On
-several matches the helper lists them and stops; then use the node ID.
+`<item>` is a `PVTI_...` node ID, an issue or PR number (`#12` or `12`), or
+a title substring that matches exactly one card (an exact title match wins;
+a number that matches no issue or PR is tried as a title). Archived cards are
+skipped, except by `list --archived` and `archive --undo`. On several matches
+the helper lists them and stops; then use the node ID.
 
 ## Configuration
 
@@ -44,7 +47,9 @@ This writes `.project-board.json` in the current directory. The helper finds
 it by searching upward. Global flags (`--owner`, `--number`, `--repo`,
 `--status-field`, placed before the subcommand) and `PROJECT_BOARD_*`
 environment variables override the file; `~/.config/project-board/config.json`
-is the fallback. `repo` is needed only for `create --issue`.
+is the fallback. The first source that sets anything supplies every key, and
+it must set both owner and number. `repo` is needed only for
+`create --issue`.
 
 ## Learn the board first
 
@@ -158,16 +163,18 @@ language so hard to understand?", arXiv:2610.29162):
   `options --remove`, and `gh project field-delete`. Prefer `archive`, which
   `archive --undo` reverses.
 - **Report each change** as "title: old column → new column".
-- **API limits.** GitHub's GraphQL API is rate limited per hour. A title or
-  number lookup lists the whole board, so in bulk edits use the `PVTI_` node
-  IDs that `list` prints; each node-ID lookup is one small query.
+- **API limits.** GitHub's GraphQL API allows 5,000 points per hour. A
+  `list`, or a lookup by title or number, reads the whole board (about 2
+  points per 100 cards). In bulk edits use the `PVTI_` node IDs that `list`
+  prints; each node-ID lookup is one small query.
 
 ## Managing the board itself
 
 - **Columns and other single-select options:** use `options`. It is a dry run
   until `--apply`. It sends existing options back with their IDs, so cards
   keep their values through renames and reorders. A removed option clears
-  that value on its cards.
+  that value on its cards. Renames run first, so `--remove` and `--order`
+  accept new names; renaming onto an existing name is refused.
 - **Fields** (`gh project` commands; use the board's owner and number):
   ```bash
   gh project field-create <number> --owner <owner> --name Area \

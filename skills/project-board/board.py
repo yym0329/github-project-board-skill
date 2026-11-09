@@ -4,17 +4,20 @@
 Stdlib only. Every subcommand shells out to the GitHub CLI, which needs the
 `project` token scope (`gh auth refresh -h github.com -s project`).
 
-The board is chosen by, highest priority first: the global flags --owner,
---number, --repo and --status-field; the environment variables
-PROJECT_BOARD_OWNER, PROJECT_BOARD_NUMBER, PROJECT_BOARD_REPO and
-PROJECT_BOARD_STATUS_FIELD; the nearest .project-board.json found by searching
-upward from the current directory; and ~/.config/project-board/config.json.
-`board.py init OWNER NUMBER` writes .project-board.json in the current
-directory.
+The board (owner, number, and optionally repo and status_field) comes from
+exactly one of these sources, highest priority first: the global flags
+--owner/--number/--repo/--status-field; the environment variables
+PROJECT_BOARD_OWNER/_NUMBER/_REPO/_STATUS_FIELD; the nearest
+.project-board.json found by searching upward from the current directory; and
+~/.config/project-board/config.json. A source that sets any key must set both
+owner and number; keys are never mixed across sources. `board.py init OWNER
+NUMBER` writes .project-board.json in the current directory.
 
-Items can be named by node ID (PVTI_...), by issue or pull request number
-(#12 or 12), or by a case-insensitive title substring that matches exactly one
-item (an exact title match wins over substring matches).
+Items can be named by node ID (PVTI_...), by issue or PR number (#12 or 12),
+or by a case-insensitive title substring that matches exactly one item. An
+exact title match wins over substring matches, and a number that matches no
+issue or PR is tried as a title. Archived items are skipped except by
+`list --archived` and `archive --undo`.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ import os
 import pathlib
 import subprocess
 import sys
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 CONFIG_FILENAME = ".project-board.json"
 USER_CONFIG = pathlib.Path(".config", "project-board", "config.json")
@@ -35,9 +38,10 @@ ENV_PREFIX = "PROJECT_BOARD_"
 CONFIG_KEYS = ("owner", "number", "repo", "status_field")
 DEFAULT_STATUS_FIELD = "Status"
 ITEM_LIMIT = 1000
+PAGE_SIZE = 100
 
 MISSING_CONFIG_HELP = """\
-No project board configured (missing: {missing}).
+No project board configured (owner and number are required).
 Set the board in one of these ways, highest priority first:
   flags:        board.py --owner LOGIN --number N [--repo OWNER/NAME] ...
   environment:  PROJECT_BOARD_OWNER, PROJECT_BOARD_NUMBER,
@@ -45,7 +49,8 @@ Set the board in one of these ways, highest priority first:
   project file: .project-board.json in this directory or a parent
                 (create it with: board.py init LOGIN N [--repo OWNER/NAME])
   user file:    ~/.config/project-board/config.json
-Both files hold JSON such as {{"owner": "octocat", "number": 1}}."""
+Both files hold JSON such as {"owner": "octocat", "number": 1}.
+All keys come from the first source that sets any of them."""
 
 
 class BoardError(Exception):
@@ -61,12 +66,14 @@ class Config:
         number: Project number, as in .../projects/<number>.
         repo: OWNER/NAME repository for `create --issue`, or None.
         status_field: Name of the single-select field that holds the columns.
+        source: Where the configuration came from, for messages.
     """
 
     owner: str
     number: int
     repo: Optional[str] = None
     status_field: str = DEFAULT_STATUS_FIELD
+    source: str = ""
 
 
 def find_project_config(start: pathlib.Path) -> Optional[pathlib.Path]:
@@ -96,7 +103,11 @@ def load_config(flags: Mapping[str, Any],
                 env: Mapping[str, str],
                 cwd: pathlib.Path,
                 home: pathlib.Path) -> Config:
-    """Resolves the board configuration key by key.
+    """Resolves the board configuration from one source.
+
+    Sources are tried in order: flags, env, the nearest project file, the
+    user file. The first source that sets any key supplies every key, so a
+    flag or environment variable never combines with a file's values.
 
     Args:
         flags: Values from the global CLI flags; None means not given.
@@ -105,44 +116,47 @@ def load_config(flags: Mapping[str, Any],
         home: Home directory holding .config/project-board/config.json.
 
     Returns:
-        The merged configuration. Each key comes from the highest-priority
-        source that sets it: flags, then env, then the nearest project file,
-        then the user file.
+        The configuration from the first source that sets anything.
 
     Raises:
-        BoardError: If owner or number is missing or invalid, or a config
-            file is unreadable.
+        BoardError: If no source sets the board, the chosen source lacks
+            owner or number, the number is not an integer, or a config file
+            is unreadable.
     """
-    layers: List[Mapping[str, Any]] = [
-        flags,
-        {key: env.get(ENV_PREFIX + key.upper()) for key in CONFIG_KEYS},
+    sources: List[Tuple[str, Mapping[str, Any], Mapping[str, str]]] = [
+        ("flags", flags, {k: "--" + k.replace("_", "-") for k in CONFIG_KEYS}),
+        ("environment",
+         {k: env.get(ENV_PREFIX + k.upper()) for k in CONFIG_KEYS},
+         {k: ENV_PREFIX + k.upper() for k in CONFIG_KEYS}),
     ]
-    project_file = find_project_config(cwd)
-    if project_file:
-        layers.append(_read_config_file(project_file))
-    user_file = home / USER_CONFIG
-    if user_file.is_file():
-        layers.append(_read_config_file(user_file))
+    for path in (find_project_config(cwd), home / USER_CONFIG):
+        if path and path.is_file():
+            sources.append((str(path), _read_config_file(path),
+                            {k: k for k in CONFIG_KEYS}))
 
-    merged: Dict[str, Any] = {}
-    for key in CONFIG_KEYS:
-        for layer in layers:
-            value = layer.get(key)
-            if value not in (None, ""):
-                merged[key] = value
-                break
-    missing = [k for k in ("owner", "number") if k not in merged]
-    if missing:
-        raise BoardError(MISSING_CONFIG_HELP.format(missing=", ".join(missing)))
-    try:
-        number = int(merged["number"])
-    except (TypeError, ValueError):
-        raise BoardError(f"project number must be an integer, "
-                         f"got {merged['number']!r}") from None
-    return Config(owner=str(merged["owner"]), number=number,
-                  repo=merged.get("repo"),
-                  status_field=merged.get("status_field",
-                                          DEFAULT_STATUS_FIELD))
+    for source, layer, names in sources:
+        values = {k: layer.get(k) for k in CONFIG_KEYS
+                  if layer.get(k) not in (None, "")}
+        if not values:
+            continue
+        missing = [names[k] for k in ("owner", "number") if k not in values]
+        if missing:
+            given = ", ".join(names[k] for k in values)
+            raise BoardError(
+                f"{source} sets {given} but not {' or '.join(missing)}. "
+                "The board's owner and number must come from the same "
+                "source; other sources are not combined with it.")
+        try:
+            number = int(values["number"])
+        except (TypeError, ValueError):
+            raise BoardError(f"{source}: project number must be an integer, "
+                             f"got {values['number']!r}") from None
+        return Config(owner=str(values["owner"]), number=number,
+                      repo=values.get("repo"),
+                      status_field=values.get("status_field",
+                                              DEFAULT_STATUS_FIELD),
+                      source=source)
+    raise BoardError(MISSING_CONFIG_HELP)
 
 
 def gh(*args: str, stdin: Optional[str] = None) -> str:
@@ -163,14 +177,16 @@ def gh(*args: str, stdin: Optional[str] = None) -> str:
     return proc.stdout
 
 
-# The project may belong to a user or an organization, so the query goes
-# through repositoryOwner and asks both concrete types.
-PROJECT_QUERY = """
-query($owner: String!, $number: Int!) {
+# The project may belong to a user or an organization, so queries go through
+# repositoryOwner and ask both concrete types.
+OWNER_WRAPPER = """
   repositoryOwner(login: $owner) {
     ... on User { projectV2(number: $number) { ...board } }
     ... on Organization { projectV2(number: $number) { ...board } }
-  }
+  }"""
+
+PROJECT_QUERY = """
+query($owner: String!, $number: Int!) {%s
 }
 fragment board on ProjectV2 {
   id
@@ -180,31 +196,86 @@ fragment board on ProjectV2 {
     ... on ProjectV2IterationField {
       configuration { iterations { id title startDate } } }
   } }
-}"""
+}""" % OWNER_WRAPPER
 
-ITEM_QUERY = """
-query($id: ID!, $status: String!) { node(id: $id) { ... on ProjectV2Item {
+FIELD_NAME = "field { ... on ProjectV2FieldCommon { name } }"
+
+ITEM_FRAGMENT = """
+fragment item on ProjectV2Item {
   id
-  status: fieldValueByName(name: $status) {
-    ... on ProjectV2ItemFieldSingleSelectValue { name } }
+  isArchived
+  fieldValues(first: 50) { nodes {
+    ... on ProjectV2ItemFieldSingleSelectValue { name %(f)s }
+    ... on ProjectV2ItemFieldTextValue { text %(f)s }
+    ... on ProjectV2ItemFieldNumberValue { number %(f)s }
+    ... on ProjectV2ItemFieldDateValue { date %(f)s }
+    ... on ProjectV2ItemFieldIterationValue { title %(f)s }
+  } }
   content {
     __typename
     ... on DraftIssue { id title body }
-    ... on Issue { id title body number url }
-    ... on PullRequest { id title body number url }
-  } } } }"""
+    ... on Issue { id title body number url
+      assignees(first: 10) { nodes { login } } }
+    ... on PullRequest { id title body number url
+      assignees(first: 10) { nodes { login } } }
+  }
+}""" % {"f": FIELD_NAME}
+
+ITEM_QUERY = """
+query($id: ID!) { node(id: $id) { ...item } }""" + ITEM_FRAGMENT
+
+# %(qvar)s and %(qarg)s add the Projects filter only when one is given.
+ITEMS_QUERY = """
+query($owner: String!, $number: Int!, $status: String!, $cursor: String%(qvar)s)
+{%(wrapper)s
+}
+fragment board on ProjectV2 {
+  field(name: $status) {
+    ... on ProjectV2SingleSelectField { options { name } } }
+  items(first: %(page)d, after: $cursor%(qarg)s) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ...item }
+  }
+}""" + ITEM_FRAGMENT
 
 OPTIONS_MUTATION = """
 mutation($field: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]) {
-  updateProjectV2Field(input: {fieldId: $field, singleSelectOptions: $options}) {
+  updateProjectV2Field(input: {fieldId: $field,
+                               singleSelectOptions: $options}) {
     projectV2Field { ... on ProjectV2SingleSelectField { options { name } } }
   }
 }"""
 
 
-def _key(name: str) -> str:
-    """Normalizes a field name for comparison (case and spaces ignored)."""
-    return name.replace(" ", "").lower()
+def parse_item(node: Dict[str, Any], status_field: str) -> Dict[str, Any]:
+    """Turns a ProjectV2Item GraphQL node into the dict the commands use.
+
+    Args:
+        node: A node selected with ITEM_FRAGMENT.
+        status_field: Name of the columns field.
+
+    Returns:
+        A dict with id, title, status, archived, fields (field name to
+        value), assignees and content (with "type" in place of __typename).
+    """
+    content = dict(node.get("content") or {})
+    content["type"] = content.pop("__typename", None)
+    assignees = [a["login"] for a in
+                 (content.pop("assignees", None) or {}).get("nodes", [])]
+    values: Dict[str, Any] = {}
+    for value in (node.get("fieldValues") or {}).get("nodes", []):
+        name = ((value or {}).get("field") or {}).get("name")
+        if not name or name == "Title":
+            continue
+        for key in ("name", "text", "number", "date", "title"):
+            if key in value:
+                values[name] = value[key]
+                break
+    status = next((v for k, v in values.items()
+                   if k.lower() == status_field.lower()), None)
+    return {"id": node["id"], "title": content.get("title", ""),
+            "status": status, "archived": bool(node.get("isArchived")),
+            "fields": values, "assignees": assignees, "content": content}
 
 
 class Board:
@@ -212,16 +283,24 @@ class Board:
 
     def __init__(self, config: Config):
         self.config = config
-        self._owner_args = ("--owner", config.owner)
+        self.status_order: List[str] = []
 
     # -- GitHub access -----------------------------------------------------
 
     def graphql(self, query: str, **variables: Any) -> Dict[str, Any]:
-        """Runs a GraphQL query through `gh api graphql` and returns data."""
+        """Runs a GraphQL query through `gh api graphql` and returns data.
+
+        Integers and None are sent as typed values (-F); strings as raw
+        strings (-f), so a numeric-looking string stays a string.
+        """
         args = ["api", "graphql", "-f", f"query={query}"]
         for name, value in variables.items():
-            flag = "-F" if isinstance(value, int) else "-f"
-            args += [flag, f"{name}={value}"]
+            if value is None:
+                args += ["-F", f"{name}=null"]
+            elif isinstance(value, int):
+                args += ["-F", f"{name}={value}"]
+            else:
+                args += ["-f", f"{name}={value}"]
         out = json.loads(gh(*args))
         if out.get("errors"):
             raise BoardError(json.dumps(out["errors"]))
@@ -230,18 +309,20 @@ class Board:
     def project_cmd(self, subcommand: str, *args: str) -> str:
         """Runs `gh project <subcommand> <number> --owner <owner> ...`."""
         return gh("project", subcommand, str(self.config.number),
-                  *self._owner_args, *args)
+                  "--owner", self.config.owner, *args)
 
-    @functools.cached_property
-    def _project(self) -> Dict[str, Any]:
-        data = self.graphql(PROJECT_QUERY, owner=self.config.owner,
-                            number=self.config.number)
-        owner = data.get("repositoryOwner")
-        project = (owner or {}).get("projectV2")
+    def _project_of(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        project = (data.get("repositoryOwner") or {}).get("projectV2")
         if not project:
             raise BoardError(f"no project {self.config.number} for owner "
                              f"{self.config.owner!r}, or no access to it")
         return project
+
+    @functools.cached_property
+    def _project(self) -> Dict[str, Any]:
+        return self._project_of(self.graphql(
+            PROJECT_QUERY, owner=self.config.owner,
+            number=self.config.number))
 
     @property
     def project_id(self) -> str:
@@ -262,40 +343,57 @@ class Board:
 
     # -- Items ---------------------------------------------------------------
 
-    def items(self, query: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Lists non-archived items; the API cannot list archived ones."""
-        args = ["--limit", str(ITEM_LIMIT), "--format", "json"]
-        if query:
-            args += ["--query", query]
-        rows = json.loads(self.project_cmd("item-list", *args))["items"]
-        return [self._normalize(row) for row in rows]
+    def items(self, query: Optional[str] = None,
+              archived: bool = False) -> List[Dict[str, Any]]:
+        """Lists the board's items, paginated, in board order.
 
-    def _normalize(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        """Puts the status column under "status" for any status field name."""
-        status_key = _key(self.config.status_field)
-        row = dict(row)
-        row["status"] = next((v for k, v in row.items()
-                              if _key(k) == status_key), None)
-        return row
+        Also records the status field's option order in self.status_order.
+
+        Args:
+            query: Optional Projects filter, e.g. "priority:P0".
+            archived: If True, return only archived items; otherwise only
+                non-archived ones.
+
+        Returns:
+            Items as returned by parse_item.
+        """
+        text = ITEMS_QUERY % {
+            "wrapper": OWNER_WRAPPER, "page": PAGE_SIZE,
+            "qvar": ", $q: String!" if query else "",
+            "qarg": ", query: $q" if query else ""}
+        extra = {"q": query} if query else {}
+        rows: List[Dict[str, Any]] = []
+        cursor = None
+        while len(rows) < ITEM_LIMIT:
+            project = self._project_of(self.graphql(
+                text, owner=self.config.owner, number=self.config.number,
+                status=self.config.status_field, cursor=cursor, **extra))
+            options = (project.get("field") or {}).get("options") or []
+            self.status_order = [o["name"] for o in options]
+            page = project["items"]
+            rows += [parse_item(n, self.config.status_field)
+                     for n in page["nodes"] if n]
+            if not page["pageInfo"]["hasNextPage"]:
+                break
+            cursor = page["pageInfo"]["endCursor"]
+        return [r for r in rows if r["archived"] == archived]
 
     def item_by_id(self, node_id: str) -> Dict[str, Any]:
-        """Fetches one item by node ID with one small query."""
-        node = self.graphql(ITEM_QUERY, id=node_id,
-                            status=self.config.status_field).get("node")
-        if not node:
-            raise BoardError(f"no item {node_id}")
-        content = dict(node.get("content") or {})
-        content["type"] = content.pop("__typename", None)
-        return {"id": node["id"], "title": content.get("title", ""),
-                "status": (node.get("status") or {}).get("name"),
-                "content": content}
+        """Fetches one item, with all its field values, in one query."""
+        node = self.graphql(ITEM_QUERY, id=node_id).get("node")
+        if not node or "isArchived" not in node:
+            raise BoardError(f"no project item {node_id}")
+        return parse_item(node, self.config.status_field)
 
-    def resolve(self, ref: str) -> Dict[str, Any]:
+    def resolve(self, ref: str, archived: bool = False) -> Dict[str, Any]:
         """Finds exactly one item by node ID, number or title.
 
         Args:
             ref: A PVTI_ node ID, an issue/PR number ("#12" or "12"), or a
-                case-insensitive title substring.
+                case-insensitive title substring. A number that matches no
+                issue or PR is matched as a title.
+            archived: Search archived items instead of current ones (node IDs
+                are found either way).
 
         Returns:
             The matching item.
@@ -305,27 +403,33 @@ class Board:
         """
         if ref.startswith("PVTI_"):
             return self.item_by_id(ref)
-        all_items = self.items()
+        all_items = self.items(archived=archived)
+        hits: List[Dict[str, Any]] = []
         if ref.lstrip("#").isdigit():
             number = int(ref.lstrip("#"))
             hits = [i for i in all_items
                     if (i.get("content") or {}).get("number") == number]
-        else:
+        if not hits:
             needle = ref.lower()
             hits = [i for i in all_items if needle in i["title"].lower()]
             exact = [i for i in hits if i["title"].lower() == needle]
             if len(exact) == 1:
                 hits = exact
         if len(hits) != 1:
+            where = "archived items" if archived else "items"
             found = "\n".join(f"  {i['id']}  {i['title']}" for i in hits)
-            raise BoardError(f"{len(hits)} items match {ref!r}"
+            raise BoardError(f"{len(hits)} {where} match {ref!r}"
                              + (f"; use the node ID:\n{found}" if hits else ""))
         return hits[0]
 
-    def set_field(self, item_id: str, name: str, value: str) -> None:
+    def set_field(self, item_id: str, name: str, value: str) -> str:
         """Sets one field on one item; '' clears it.
 
         The gh flag is chosen from the field's GraphQL dataType.
+
+        Returns:
+            The value as the board names it (e.g. the option's real
+            capitalization), or "" when cleared.
 
         Raises:
             BoardError: If the field, option or iteration does not exist, or
@@ -339,27 +443,32 @@ class Board:
                              "edit the issue or PR with `gh issue edit`")
         args = ["project", "item-edit", "--id", item_id,
                 "--project-id", self.project_id, "--field-id", f["id"]]
+        shown = value
         if value == "":
             args.append("--clear")
         elif kind == "SINGLE_SELECT":
-            options = {o["name"].lower(): o["id"] for o in f["options"]}
+            options = {o["name"].lower(): o for o in f["options"]}
             if value.lower() not in options:
                 names = ", ".join(o["name"] for o in f["options"])
                 raise BoardError(f"{f['name']} has no option {value!r}; "
                                  f"options: {names}")
-            args += ["--single-select-option-id", options[value.lower()]]
+            option = options[value.lower()]
+            args += ["--single-select-option-id", option["id"]]
+            shown = option["name"]
         elif kind == "ITERATION":
             iterations = (f.get("configuration") or {}).get("iterations", [])
-            ids = {i["title"].lower(): i["id"] for i in iterations}
-            if value.lower() not in ids:
+            by_title = {i["title"].lower(): i for i in iterations}
+            if value.lower() not in by_title:
                 titles = ", ".join(i["title"] for i in iterations)
                 raise BoardError(f"{f['name']} has no iteration {value!r}; "
                                  f"iterations: {titles}")
-            args += ["--iteration-id", ids[value.lower()]]
+            args += ["--iteration-id", by_title[value.lower()]["id"]]
+            shown = by_title[value.lower()]["title"]
         else:
             flag = {"NUMBER": "--number", "DATE": "--date"}.get(kind, "--text")
             args += [flag, value]
         gh(*args)
+        return shown
 
     def add_url(self, url: str) -> str:
         """Adds an issue or PR to the board and returns the item ID."""
@@ -375,46 +484,72 @@ def plan_options(f: Dict[str, Any], add: Optional[List[str]] = None,
                  order: Optional[str] = None) -> List[Dict[str, Any]]:
     """Computes a single-select field's new option list.
 
-    Existing options keep their IDs, so cards keep their values through
-    renames and reorders. New options have no ID and are colored GRAY.
+    Steps run in this order: rename, remove, add, order. Existing options
+    keep their IDs, so cards keep their values through renames and reorders.
+    New options have no ID and are colored GRAY.
 
     Args:
         f: The field as returned by Board.fields.
         add: Names of options to append.
         rename: "OLD=NEW" pairs.
-        remove: Names of options to drop.
+        remove: Names of options to drop; the old or the new name of an
+            option renamed in the same call both work.
         order: Comma-separated list of every resulting option name.
 
     Returns:
         The options payload for updateProjectV2Field.
 
     Raises:
-        BoardError: On unknown names, duplicates or an incomplete --order.
+        BoardError: On unknown names, duplicate names or an incomplete or
+            repeated --order.
     """
     if f["dataType"] != "SINGLE_SELECT":
         raise BoardError(f"{f['name']} is not a single-select field")
     options = [{k: o.get(k) or "" for k in ("id", "name", "color",
                                               "description")}
                for o in f["options"]]
-    by_name = {o["name"].lower(): o for o in options}
-    names = ", ".join(o["name"] for o in options)
+    original = {o["name"].lower(): opt for o, opt in zip(f["options"],
+                                                         options)}
+
+    def current_names() -> str:
+        return ", ".join(o["name"] for o in options)
+
+    def find(name: str) -> Optional[Dict[str, Any]]:
+        for o in options:
+            if o["name"].lower() == name.lower():
+                return o
+        o = original.get(name.lower())
+        return o if o in options else None
+
     for pair in rename or []:
         old, _, new = pair.partition("=")
-        if old.lower() not in by_name or not new:
-            raise BoardError(f"bad --rename {pair!r}; options: {names}")
-        by_name[old.lower()]["name"] = new
+        option = find(old)
+        if option is None or not new:
+            raise BoardError(f"bad --rename {pair!r}; options: "
+                             f"{current_names()}")
+        clash = next((o for o in options if o is not option
+                      and o["name"].lower() == new.lower()), None)
+        if clash:
+            raise BoardError(f"cannot rename {old!r} to {new!r}: an option "
+                             "with that name already exists")
+        option["name"] = new
     for name in remove or []:
-        if name.lower() not in by_name:
-            raise BoardError(f"no option {name!r}; options: {names}")
-        options.remove(by_name.pop(name.lower()))
+        option = find(name)
+        if option is None:
+            raise BoardError(f"no option {name!r}; options: "
+                             f"{current_names()}")
+        options.remove(option)
     for name in add or []:
         if any(o["name"].lower() == name.lower() for o in options):
             raise BoardError(f"option {name!r} already exists")
         options.append({"name": name, "color": "GRAY", "description": ""})
     if order:
-        rank = {n.strip().lower(): k for k, n in enumerate(order.split(","))}
-        if set(rank) != {o["name"].lower() for o in options}:
-            raise BoardError("--order must list every option exactly once")
+        wanted = [n.strip().lower() for n in order.split(",")]
+        if (len(wanted) != len(set(wanted))
+                or set(wanted) != {o["name"].lower() for o in options}):
+            raise BoardError("--order must list every option exactly once; "
+                             f"options: {current_names()}")
+        rank = {n: k for k, n in enumerate(wanted)}
         options.sort(key=lambda o: rank[o["name"].lower()])
     return options
 
@@ -443,24 +578,34 @@ def cmd_fields(board: Board, _args: argparse.Namespace) -> None:
 
 
 def cmd_list(board: Board, args: argparse.Namespace) -> None:
-    rows = board.items(args.query)
+    rows = board.items(args.query, archived=args.archived)
     if args.status:
         rows = [i for i in rows
                 if (i.get("status") or "").lower() == args.status.lower()]
-    for i in sorted(rows, key=lambda i: i.get("status") or ""):
+    rank = {name.lower(): k for k, name in enumerate(board.status_order)}
+
+    def column(item: Dict[str, Any]) -> Tuple[int, str]:
+        status = item.get("status")
+        if not status:
+            return (len(rank) + 1, "")
+        return (rank.get(status.lower(), len(rank)), status.lower())
+
+    for i in sorted(rows, key=column):   # stable: board order within column
         c = i.get("content") or {}
         ref = f"#{c['number']}" if c.get("number") else "draft"
         who = ",".join(i.get("assignees") or [])
         print(f"{i.get('status') or '-':<14} {ref:<7} {i['title']}"
               f"{'  @' + who if who else ''}  [{i['id']}]")
-    print(f"{len(rows)} items")
+    print(f"{len(rows)} {'archived ' if args.archived else ''}items")
 
 
 def cmd_show(board: Board, args: argparse.Namespace) -> None:
     i = board.resolve(args.item)
     c = i.get("content") or {}
-    print(json.dumps({k: v for k, v in i.items() if k != "content"},
-                     indent=2, ensure_ascii=False))
+    summary = {"id": i["id"], "title": i["title"], "type": c.get("type"),
+               "status": i["status"], "archived": i["archived"],
+               "assignees": i["assignees"], "fields": i["fields"]}
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
     if c.get("url"):
         print(c["url"])
     print("\n" + (c.get("body") or "(no body)"))
@@ -469,8 +614,10 @@ def cmd_show(board: Board, args: argparse.Namespace) -> None:
 def cmd_create(board: Board, args: argparse.Namespace) -> None:
     if args.issue:
         if not board.config.repo:
-            raise BoardError("create --issue needs a repository: set --repo, "
-                             "PROJECT_BOARD_REPO or \"repo\" in the config")
+            raise BoardError("create --issue needs a repository: set "
+                             "\"repo\" in the same source as owner and "
+                             "number (--repo, PROJECT_BOARD_REPO or the "
+                             "config file)")
         url = gh("issue", "create", "--repo", board.config.repo,
                  "--title", args.title, "--body", args.body or "").strip()
         item_id = board.add_url(url)
@@ -493,44 +640,41 @@ def cmd_add(board: Board, args: argparse.Namespace) -> None:
 
 def cmd_move(board: Board, args: argparse.Namespace) -> None:
     i = board.resolve(args.item)
-    board.set_field(i["id"], board.config.status_field, args.status)
-    print(f"{i['title']}: {i.get('status') or '-'} -> {args.status}")
+    new = board.set_field(i["id"], board.config.status_field, args.status)
+    print(f"{i['title']}: {i.get('status') or '-'} -> {new or '-'}")
 
 
 def cmd_set(board: Board, args: argparse.Namespace) -> None:
     i = board.resolve(args.item)
-    board.set_field(i["id"], args.field, args.value)
-    print(f"{i['title']}: {args.field} = {args.value!r}")
+    new = board.set_field(i["id"], args.field, args.value)
+    print(f"{i['title']}: {args.field} = {new!r}")
 
 
 def cmd_edit(board: Board, args: argparse.Namespace) -> None:
     """Edits a draft's title or body; issues use `gh issue edit`."""
+    if args.title is None and args.body is None:
+        raise BoardError("give --title, --body or both")
+    if args.title is not None and not args.title.strip():
+        raise BoardError("--title cannot be empty")
     i = board.resolve(args.item)
     c = i.get("content") or {}
     if c.get("type") != "DraftIssue":
         raise BoardError(f"not a draft; use: gh issue edit {c.get('url')}")
-    if args.title is None and args.body is None:
-        raise BoardError("give --title, --body or both")
     cmd = ["project", "item-edit", "--id", c["id"]]
-    if args.title:
+    if args.title is not None:
         cmd += ["--title", args.title]
     if args.body is not None:
         cmd += ["--body", args.body]
     gh(*cmd)
-    print(f"edited {i['id']}")
+    print(f"edited {i['title']}  [{i['id']}]")
 
 
 def cmd_archive(board: Board, args: argparse.Namespace) -> None:
+    i = board.resolve(args.item, archived=args.undo)
     if args.undo:
-        # Archived items are invisible to item-list, so undo needs the node
-        # ID that `archive` printed.
-        if not args.item.startswith("PVTI_"):
-            raise BoardError("archive --undo needs the PVTI_ node ID that "
-                             "archive printed")
-        board.project_cmd("item-archive", "--id", args.item, "--undo")
-        print(f"unarchived: {args.item}")
+        board.project_cmd("item-archive", "--id", i["id"], "--undo")
+        print(f"unarchived: {i['title']}  [{i['id']}]")
         return
-    i = board.resolve(args.item)
     board.project_cmd("item-archive", "--id", i["id"])
     print(f"archived: {i['title']}  [{i['id']}]")
 
@@ -571,8 +715,9 @@ def build_parser() -> argparse.ArgumentParser:
     """Builds the argument parser with global board flags and subcommands."""
     p = argparse.ArgumentParser(
         description="Manage a GitHub Projects (v2) board through gh.",
-        epilog="Board selection: flags > PROJECT_BOARD_* env vars > nearest "
-               ".project-board.json > ~/.config/project-board/config.json.")
+        epilog="Board selection (one source supplies every key): flags > "
+               "PROJECT_BOARD_* env vars > nearest .project-board.json > "
+               "~/.config/project-board/config.json.")
     p.add_argument("--owner", dest="g_owner",
                    help="user or organization login that owns the project")
     p.add_argument("--number", dest="g_number", type=int,
@@ -591,11 +736,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true",
                    help="overwrite an existing file")
     sub.add_parser("fields", help="list fields, types and options")
-    s = sub.add_parser("list", help="list items, grouped by status")
+    s = sub.add_parser("list", help="list items in board column order")
     s.add_argument("--status", help="only this column")
     s.add_argument("--query",
                    help='Projects filter, e.g. "priority:P0 -status:Done"')
-    s = sub.add_parser("show", help="show one item and its body")
+    s.add_argument("--archived", action="store_true",
+                   help="list only archived items")
+    s = sub.add_parser("show", help="show one item's fields and body")
     s.add_argument("item")
     s = sub.add_parser("create", help="create a draft (or --issue) item")
     s.add_argument("title")
@@ -617,7 +764,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("item")
     s.add_argument("--title")
     s.add_argument("--body")
-    s = sub.add_parser("archive", help="archive (or --undo) an item")
+    s = sub.add_parser("archive", help="archive an item, or --undo to "
+                       "restore an archived one")
     s.add_argument("item")
     s.add_argument("--undo", action="store_true")
     s = sub.add_parser("options", help="edit a single-select field's options "
