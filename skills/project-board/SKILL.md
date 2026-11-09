@@ -27,7 +27,8 @@ python3 $B options <Field> [--add X] [--rename Old=New] [--remove X] [--order A,
 
 `<item>` is a `PVTI_...` node ID, an issue or PR number (`#12` or `12`), or
 a title substring that matches exactly one card (an exact title match wins;
-a number that matches no issue or PR is tried as a title). Archived cards and
+a number that matches no issue or PR matches only a card whose whole title
+is that number). Archived cards and
 cards of other projects are refused, except that `archive --undo` takes an
 archived card's node ID. On several matches the helper lists them and stops;
 then use the node ID. GitHub's listing can trail a change by about a minute,

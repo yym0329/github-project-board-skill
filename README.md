@@ -22,8 +22,8 @@ existing `gh` login.
   An empty value clears the field.
 - Refer to a card by its node ID (`PVTI_...`), its issue or pull request
   number (`#12` or `12`), or part of its title. If a number matches no issue
-  or pull request, it is tried as a title, so a card titled "2026" can still
-  be found.
+  or pull request, it matches only a card whose whole title is that number
+  (so `12` finds a card titled "12", never "Release 2.12 notes").
 - Add, rename, remove and reorder the options of a single-select field (for
   example, the board's columns). Cards keep their values when you rename or
   reorder. Nothing changes until you pass `--apply`.
@@ -121,10 +121,13 @@ python3 $B list --query "priority:P0 -status:Done"  # GitHub's filter syntax
 python3 $B create "Search API: add pagination" --body "Goal: ..." --status Ready
 python3 $B create "Fix login timeout" --issue     # real issue in the repo
 python3 $B add https://github.com/octocat/hello-world/pull/7 --status "In review"
+python3 $B show "pagination"                      # fields, URL and body
 python3 $B move "#7" Done
 python3 $B set "pagination" Priority P1
 python3 $B set "pagination" "Target date" 2026-12-01
 python3 $B set "pagination" Estimate ""           # clear a field
+python3 $B edit "pagination" --body "Goal: ..."   # draft cards only
+python3 $B delete "pagination"                    # permanent; prefer archive
 python3 $B archive "pagination"                   # prints the card's PVTI_ ID
 python3 $B archive PVTI_lADOxxxx --undo           # restore by that ID
 python3 $B options Status --rename "Todo=Backlog" --add "In review"   # dry run

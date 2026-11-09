@@ -330,6 +330,13 @@ class ItemsTest(BoardTestCase):
         out = self.run_cmd(["list", "--status", "backlog"])
         self.assertEqual(out.count("PVTI_"), 2)
 
+    def test_list_unknown_status_lists_columns(self):
+        with self.assertRaises(board.BoardError) as ctx:
+            self.run_cmd(["list", "--status", "Doing"])
+        self.assertIn("Backlog, In progress, Done", str(ctx.exception))
+        self.assertFalse(any("items(first" in q
+                             for q in self.fake.graphql_queries()))
+
     def test_list_has_no_archived_option(self):
         with self.assertRaises(SystemExit), \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -399,8 +406,23 @@ class ResolveTest(BoardTestCase):
         self.assertEqual(self.board.resolve("#13")["id"], "PVTI_b")
         self.assertEqual(self.board.resolve("12")["id"], "PVTI_a")
 
-    def test_digit_title_falls_back_to_title_match(self):
+    def test_digit_title_falls_back_to_exact_title_only(self):
+        self.fake.nodes = NODES + [node("PVTI_h", "Release 2.12 notes")]
         self.assertEqual(self.board.resolve("2026")["id"], "PVTI_e")
+        self.assertEqual(self.board.resolve(" 2026 ")["id"], "PVTI_e")
+        # "12" is issue #12; "2" and "212" are no issue and no whole title,
+        # so they must not substring-match "Release 2.12 notes" or "2026".
+        self.assertEqual(self.board.resolve("12")["id"], "PVTI_a")
+        for ref in ("2", "#20", "212"):
+            with self.assertRaises(board.BoardError, msg=ref) as ctx:
+                self.board.resolve(ref)
+            self.assertIn("0 items match", str(ctx.exception))
+
+    def test_unicode_digits_are_not_numbers(self):
+        self.fake.nodes = NODES + [node("PVTI_u", "Area m²", "Backlog")]
+        self.assertEqual(self.board.resolve("²")["id"], "PVTI_u")
+        with self.assertRaises(board.BoardError):
+            self.board.resolve("#١٢")      # Arabic-Indic digits: no match
 
     def test_unique_title_substring_case_insensitive(self):
         self.assertEqual(self.board.resolve("NOTES")["id"], "PVTI_c")

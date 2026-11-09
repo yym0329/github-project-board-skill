@@ -16,7 +16,8 @@ NUMBER` writes .project-board.json in the current directory.
 Items can be named by node ID (PVTI_...), by issue or PR number (#12 or 12),
 or by a case-insensitive title substring that matches exactly one item. An
 exact title match wins over substring matches, and a number that matches no
-issue or PR is tried as a title. Archived items are skipped; restore one with
+issue or PR matches only a card whose whole title is that number. Archived
+items are skipped; restore one with
 `archive PVTI_... --undo`, using the node ID that `archive` printed. GitHub's
 item listing can lag a change by about a minute, so right after a change
 refer to the item by its printed node ID.
@@ -411,8 +412,8 @@ class Board:
         Args:
             ref: A PVTI_ node ID, an issue/PR number ("#12" or "12"), or a
                 case-insensitive title substring. A number that matches no
-                issue or PR is matched as a title. Archived items never
-                match.
+                issue or PR falls back to an exact title match only.
+                Archived items never match.
 
         Returns:
             The matching item.
@@ -420,15 +421,22 @@ class Board:
         Raises:
             BoardError: If no item or more than one item matches.
         """
+        ref = ref.strip()
         if ref.startswith("PVTI_"):
             return self.item_by_id(ref)
         all_items = self.items()
-        hits: List[Dict[str, Any]] = []
-        if ref.lstrip("#").isdigit():
-            number = int(ref.lstrip("#"))
+        digits = ref.lstrip("#")
+        if digits.isascii() and digits.isdecimal():
+            # A number never substring-matches a title ("12" must not pick
+            # "Release 2.12 notes"); only an exact title is a fallback.
+            number = int(digits)
             hits = [i for i in all_items
                     if (i.get("content") or {}).get("number") == number]
-        if not hits:
+            if not hits:
+                needle = ref.lower()
+                hits = [i for i in all_items
+                        if i["title"].strip().lower() == needle]
+        else:
             needle = ref.lower()
             hits = [i for i in all_items if needle in i["title"].lower()]
             exact = [i for i in hits if i["title"].lower() == needle]
@@ -609,12 +617,15 @@ def cmd_fields(board: Board, _args: argparse.Namespace) -> None:
 
 
 def cmd_list(board: Board, args: argparse.Namespace) -> None:
+    options = board.field(board.config.status_field).get("options") or []
+    rank = {o["name"].lower(): k for k, o in enumerate(options)}
+    if args.status and args.status.lower() not in rank:
+        raise BoardError(f"no column {args.status!r}; columns: "
+                         + ", ".join(o["name"] for o in options))
     rows = board.items(args.query)
     if args.status:
         rows = [i for i in rows
                 if (i.get("status") or "").lower() == args.status.lower()]
-    options = board.field(board.config.status_field).get("options") or []
-    rank = {o["name"].lower(): k for k, o in enumerate(options)}
 
     def column(item: Dict[str, Any]) -> Tuple[int, str]:
         status = item.get("status")
