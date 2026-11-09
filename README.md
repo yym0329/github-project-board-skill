@@ -15,7 +15,7 @@ existing `gh` login.
 ## Features
 
 - List, show, create, move, edit, archive and delete cards. `list` shows
-  cards in column order; `list --archived` shows archived cards.
+  cards in column order.
 - Create a card as a draft or as a real issue, or add an existing issue or
   pull request.
 - Set any editable field: single select, text, number, date and iteration.
@@ -30,7 +30,7 @@ existing `gh` login.
 - Works with projects owned by a user or by an organization.
 - Uses few API calls: it fetches the project's fields once per run and looks
   up a node ID with one small query. Archived cards are left out of lists
-  and lookups.
+  and lookups, and a node ID from another project is refused.
 
 ## Requirements
 
@@ -125,9 +125,8 @@ python3 $B move "#7" Done
 python3 $B set "pagination" Priority P1
 python3 $B set "pagination" "Target date" 2026-12-01
 python3 $B set "pagination" Estimate ""           # clear a field
-python3 $B archive "pagination"
-python3 $B list --archived                        # archived cards only
-python3 $B archive "pagination" --undo            # restore by title or PVTI_ ID
+python3 $B archive "pagination"                   # prints the card's PVTI_ ID
+python3 $B archive PVTI_lADOxxxx --undo           # restore by that ID
 python3 $B options Status --rename "Todo=Backlog" --add "In review"   # dry run
 python3 $B options Status --rename "Todo=Backlog" --add "In review" --apply
 python3 $B --owner my-org --number 3 list         # another board, one time
@@ -135,6 +134,10 @@ python3 $B --owner my-org --number 3 list         # another board, one time
 
 If a title matches more than one card, the tool lists the matches and stops.
 Use the node ID it prints instead.
+
+GitHub's card listing can take about a minute to catch up after a change.
+Right after you create, move, archive or restore a card, refer to it by the
+node ID the tool printed rather than by title or number.
 
 ## Card-writing convention
 
@@ -160,6 +163,12 @@ archived. See `skills/project-board/SKILL.md` for the full text.
 
 - **Views can't be changed.** GitHub has no API for board or table layout,
   grouping or which fields cards show. Change these in the browser.
+- **Archived cards can't be listed.** GitHub's item listing drops archived
+  cards (sometimes after a short delay), so they can't be found by title or
+  number. Keep the `PVTI_` ID that `archive` prints if you may want to undo
+  it; `archive <ID> --undo` restores the card.
+- **Listing lag.** `list` and title or number lookups can trail a change by
+  about a minute. Use the printed node ID right after a change.
 - **Rate limits.** GitHub's GraphQL API allows 5,000 points per hour. A
   `list`, or a lookup by title or number, reads the whole board and costs
   about 2 points per 100 cards (measured with a dry run). A lookup by node ID

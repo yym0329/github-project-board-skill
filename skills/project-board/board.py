@@ -16,8 +16,10 @@ NUMBER` writes .project-board.json in the current directory.
 Items can be named by node ID (PVTI_...), by issue or PR number (#12 or 12),
 or by a case-insensitive title substring that matches exactly one item. An
 exact title match wins over substring matches, and a number that matches no
-issue or PR is tried as a title. Archived items are skipped except by
-`list --archived` and `archive --undo`.
+issue or PR is tried as a title. Archived items are skipped; restore one with
+`archive PVTI_... --undo`, using the node ID that `archive` printed. GitHub's
+item listing can lag a change by about a minute, so right after a change
+refer to the item by its printed node ID.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ import os
 import pathlib
 import subprocess
 import sys
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 CONFIG_FILENAME = ".project-board.json"
 USER_CONFIG = pathlib.Path(".config", "project-board", "config.json")
@@ -107,7 +109,9 @@ def load_config(flags: Mapping[str, Any],
 
     Sources are tried in order: flags, env, the nearest project file, the
     user file. The first source that sets any key supplies every key, so a
-    flag or environment variable never combines with a file's values.
+    flag or environment variable never combines with a file's values. A file
+    is read only when every higher source is empty, so a broken file does
+    not block flags or env.
 
     Args:
         flags: Values from the global CLI flags; None means not given.
@@ -123,18 +127,20 @@ def load_config(flags: Mapping[str, Any],
             owner or number, the number is not an integer, or a config file
             is unreadable.
     """
-    sources: List[Tuple[str, Mapping[str, Any], Mapping[str, str]]] = [
-        ("flags", flags, {k: "--" + k.replace("_", "-") for k in CONFIG_KEYS}),
-        ("environment",
-         {k: env.get(ENV_PREFIX + k.upper()) for k in CONFIG_KEYS},
-         {k: ENV_PREFIX + k.upper() for k in CONFIG_KEYS}),
-    ]
-    for path in (find_project_config(cwd), home / USER_CONFIG):
-        if path and path.is_file():
-            sources.append((str(path), _read_config_file(path),
-                            {k: k for k in CONFIG_KEYS}))
+    def sources() -> Iterator[Tuple[str, Mapping[str, Any],
+                                    Mapping[str, str]]]:
+        # A generator, so files are read only if no earlier source is used.
+        yield ("flags", flags,
+               {k: "--" + k.replace("_", "-") for k in CONFIG_KEYS})
+        yield ("environment",
+               {k: env.get(ENV_PREFIX + k.upper()) for k in CONFIG_KEYS},
+               {k: ENV_PREFIX + k.upper() for k in CONFIG_KEYS})
+        for path in (find_project_config(cwd), home / USER_CONFIG):
+            if path and path.is_file():
+                yield (str(path), _read_config_file(path),
+                       {k: k for k in CONFIG_KEYS})
 
-    for source, layer, names in sources:
+    for source, layer, names in sources():
         values = {k: layer.get(k) for k in CONFIG_KEYS
                   if layer.get(k) not in (None, "")}
         if not values:
@@ -204,6 +210,7 @@ ITEM_FRAGMENT = """
 fragment item on ProjectV2Item {
   id
   isArchived
+  project { id }
   fieldValues(first: 50) { nodes {
     ... on ProjectV2ItemFieldSingleSelectValue { name %(f)s }
     ... on ProjectV2ItemFieldTextValue { text %(f)s }
@@ -226,12 +233,9 @@ query($id: ID!) { node(id: $id) { ...item } }""" + ITEM_FRAGMENT
 
 # %(qvar)s and %(qarg)s add the Projects filter only when one is given.
 ITEMS_QUERY = """
-query($owner: String!, $number: Int!, $status: String!, $cursor: String%(qvar)s)
-{%(wrapper)s
+query($owner: String!, $number: Int!, $cursor: String%(qvar)s) {%(wrapper)s
 }
 fragment board on ProjectV2 {
-  field(name: $status) {
-    ... on ProjectV2SingleSelectField { options { name } } }
   items(first: %(page)d, after: $cursor%(qarg)s) {
     pageInfo { hasNextPage endCursor }
     nodes { ...item }
@@ -283,7 +287,6 @@ class Board:
 
     def __init__(self, config: Config):
         self.config = config
-        self.status_order: List[str] = []
 
     # -- GitHub access -----------------------------------------------------
 
@@ -343,16 +346,15 @@ class Board:
 
     # -- Items ---------------------------------------------------------------
 
-    def items(self, query: Optional[str] = None,
-              archived: bool = False) -> List[Dict[str, Any]]:
-        """Lists the board's items, paginated, in board order.
+    def items(self, query: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Lists the board's non-archived items, paginated, in board order.
 
-        Also records the status field's option order in self.status_order.
+        GitHub returns a freshly archived item for a short while, so items
+        are filtered on isArchived. The listing can lag changes by about a
+        minute.
 
         Args:
             query: Optional Projects filter, e.g. "priority:P0".
-            archived: If True, return only archived items; otherwise only
-                non-archived ones.
 
         Returns:
             Items as returned by parse_item.
@@ -367,33 +369,50 @@ class Board:
         while len(rows) < ITEM_LIMIT:
             project = self._project_of(self.graphql(
                 text, owner=self.config.owner, number=self.config.number,
-                status=self.config.status_field, cursor=cursor, **extra))
-            options = (project.get("field") or {}).get("options") or []
-            self.status_order = [o["name"] for o in options]
+                cursor=cursor, **extra))
             page = project["items"]
             rows += [parse_item(n, self.config.status_field)
                      for n in page["nodes"] if n]
             if not page["pageInfo"]["hasNextPage"]:
                 break
             cursor = page["pageInfo"]["endCursor"]
-        return [r for r in rows if r["archived"] == archived]
+        return [r for r in rows if not r["archived"]]
 
-    def item_by_id(self, node_id: str) -> Dict[str, Any]:
-        """Fetches one item, with all its field values, in one query."""
+    def item_by_id(self, node_id: str,
+                   archived: bool = False) -> Dict[str, Any]:
+        """Fetches one item of this board, with all its field values.
+
+        Args:
+            node_id: The item's PVTI_ node ID.
+            archived: If True, require an archived item (for undo);
+                otherwise refuse archived items.
+
+        Raises:
+            BoardError: If the item does not exist, belongs to another
+                project, or has the wrong archived state.
+        """
         node = self.graphql(ITEM_QUERY, id=node_id).get("node")
         if not node or "isArchived" not in node:
             raise BoardError(f"no project item {node_id}")
-        return parse_item(node, self.config.status_field)
+        if (node.get("project") or {}).get("id") != self.project_id:
+            raise BoardError(f"{node_id} belongs to another project, not "
+                             f"{self.config.owner}/{self.config.number}")
+        item = parse_item(node, self.config.status_field)
+        if item["archived"] and not archived:
+            raise BoardError(f"{node_id} is archived; restore it first with "
+                             f"`archive {node_id} --undo`")
+        if archived and not item["archived"]:
+            raise BoardError(f"{node_id} is not archived")
+        return item
 
-    def resolve(self, ref: str, archived: bool = False) -> Dict[str, Any]:
+    def resolve(self, ref: str) -> Dict[str, Any]:
         """Finds exactly one item by node ID, number or title.
 
         Args:
             ref: A PVTI_ node ID, an issue/PR number ("#12" or "12"), or a
                 case-insensitive title substring. A number that matches no
-                issue or PR is matched as a title.
-            archived: Search archived items instead of current ones (node IDs
-                are found either way).
+                issue or PR is matched as a title. Archived items never
+                match.
 
         Returns:
             The matching item.
@@ -403,7 +422,7 @@ class Board:
         """
         if ref.startswith("PVTI_"):
             return self.item_by_id(ref)
-        all_items = self.items(archived=archived)
+        all_items = self.items()
         hits: List[Dict[str, Any]] = []
         if ref.lstrip("#").isdigit():
             number = int(ref.lstrip("#"))
@@ -416,20 +435,34 @@ class Board:
             if len(exact) == 1:
                 hits = exact
         if len(hits) != 1:
-            where = "archived items" if archived else "items"
             found = "\n".join(f"  {i['id']}  {i['title']}" for i in hits)
-            raise BoardError(f"{len(hits)} {where} match {ref!r}"
+            raise BoardError(f"{len(hits)} items match {ref!r}"
                              + (f"; use the node ID:\n{found}" if hits else ""))
         return hits[0]
 
     def set_field(self, item_id: str, name: str, value: str) -> str:
         """Sets one field on one item; '' clears it.
 
-        The gh flag is chosen from the field's GraphQL dataType.
-
         Returns:
             The value as the board names it (e.g. the option's real
             capitalization), or "" when cleared.
+
+        Raises:
+            BoardError: As for field_edit_args.
+        """
+        args, shown = self.field_edit_args(name, value)
+        gh("project", "item-edit", "--id", item_id, *args)
+        return shown
+
+    def field_edit_args(self, name: str, value: str) -> Tuple[List[str], str]:
+        """Validates a field value and builds its `gh project item-edit` flags.
+
+        Makes no change on GitHub, so callers can validate before writing.
+        The gh flag is chosen from the field's GraphQL dataType.
+
+        Returns:
+            The flags after `--id <item>`, and the value as the board names
+            it ("" when cleared).
 
         Raises:
             BoardError: If the field, option or iteration does not exist, or
@@ -441,8 +474,7 @@ class Board:
                         "DATE"):
             raise BoardError(f"{f['name']} ({kind}) cannot be set here; "
                              "edit the issue or PR with `gh issue edit`")
-        args = ["project", "item-edit", "--id", item_id,
-                "--project-id", self.project_id, "--field-id", f["id"]]
+        args = ["--project-id", self.project_id, "--field-id", f["id"]]
         shown = value
         if value == "":
             args.append("--clear")
@@ -467,8 +499,7 @@ class Board:
         else:
             flag = {"NUMBER": "--number", "DATE": "--date"}.get(kind, "--text")
             args += [flag, value]
-        gh(*args)
-        return shown
+        return args, shown
 
     def add_url(self, url: str) -> str:
         """Adds an issue or PR to the board and returns the item ID."""
@@ -578,11 +609,12 @@ def cmd_fields(board: Board, _args: argparse.Namespace) -> None:
 
 
 def cmd_list(board: Board, args: argparse.Namespace) -> None:
-    rows = board.items(args.query, archived=args.archived)
+    rows = board.items(args.query)
     if args.status:
         rows = [i for i in rows
                 if (i.get("status") or "").lower() == args.status.lower()]
-    rank = {name.lower(): k for k, name in enumerate(board.status_order)}
+    options = board.field(board.config.status_field).get("options") or []
+    rank = {o["name"].lower(): k for k, o in enumerate(options)}
 
     def column(item: Dict[str, Any]) -> Tuple[int, str]:
         status = item.get("status")
@@ -596,7 +628,7 @@ def cmd_list(board: Board, args: argparse.Namespace) -> None:
         who = ",".join(i.get("assignees") or [])
         print(f"{i.get('status') or '-':<14} {ref:<7} {i['title']}"
               f"{'  @' + who if who else ''}  [{i['id']}]")
-    print(f"{len(rows)} {'archived ' if args.archived else ''}items")
+    print(f"{len(rows)} items")
 
 
 def cmd_show(board: Board, args: argparse.Namespace) -> None:
@@ -612,6 +644,8 @@ def cmd_show(board: Board, args: argparse.Namespace) -> None:
 
 
 def cmd_create(board: Board, args: argparse.Namespace) -> None:
+    if args.status:    # validate before creating anything
+        board.field_edit_args(board.config.status_field, args.status)
     if args.issue:
         if not board.config.repo:
             raise BoardError("create --issue needs a repository: set "
@@ -632,6 +666,8 @@ def cmd_create(board: Board, args: argparse.Namespace) -> None:
 
 
 def cmd_add(board: Board, args: argparse.Namespace) -> None:
+    if args.status:    # validate before adding anything
+        board.field_edit_args(board.config.status_field, args.status)
     item_id = board.add_url(args.url)
     if args.status:
         board.set_field(item_id, board.config.status_field, args.status)
@@ -647,7 +683,7 @@ def cmd_move(board: Board, args: argparse.Namespace) -> None:
 def cmd_set(board: Board, args: argparse.Namespace) -> None:
     i = board.resolve(args.item)
     new = board.set_field(i["id"], args.field, args.value)
-    print(f"{i['title']}: {args.field} = {new!r}")
+    print(f"{i['title']}: {board.field(args.field)['name']} = {new!r}")
 
 
 def cmd_edit(board: Board, args: argparse.Namespace) -> None:
@@ -670,11 +706,18 @@ def cmd_edit(board: Board, args: argparse.Namespace) -> None:
 
 
 def cmd_archive(board: Board, args: argparse.Namespace) -> None:
-    i = board.resolve(args.item, archived=args.undo)
     if args.undo:
+        # Archived items drop out of GitHub's listing, so undo needs the
+        # node ID that `archive` printed.
+        if not args.item.startswith("PVTI_"):
+            raise BoardError("archive --undo needs the PVTI_ node ID that "
+                             "archive printed; archived items cannot be "
+                             "found by title or number")
+        i = board.item_by_id(args.item, archived=True)
         board.project_cmd("item-archive", "--id", i["id"], "--undo")
         print(f"unarchived: {i['title']}  [{i['id']}]")
         return
+    i = board.resolve(args.item)
     board.project_cmd("item-archive", "--id", i["id"])
     print(f"archived: {i['title']}  [{i['id']}]")
 
@@ -740,8 +783,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--status", help="only this column")
     s.add_argument("--query",
                    help='Projects filter, e.g. "priority:P0 -status:Done"')
-    s.add_argument("--archived", action="store_true",
-                   help="list only archived items")
     s = sub.add_parser("show", help="show one item's fields and body")
     s.add_argument("item")
     s = sub.add_parser("create", help="create a draft (or --issue) item")
@@ -765,9 +806,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--title")
     s.add_argument("--body")
     s = sub.add_parser("archive", help="archive an item, or --undo to "
-                       "restore an archived one")
+                       "restore one by the PVTI_ ID that archive printed")
     s.add_argument("item")
-    s.add_argument("--undo", action="store_true")
+    s.add_argument("--undo", action="store_true",
+                   help="restore; ITEM must be the PVTI_ node ID")
     s = sub.add_parser("options", help="edit a single-select field's options "
                        "(columns); dry run unless --apply")
     s.add_argument("field")

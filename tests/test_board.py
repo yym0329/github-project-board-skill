@@ -43,7 +43,7 @@ FIELDS = [
 
 
 def node(item_id, title, status=None, number=None, archived=False,
-         values=None, body="", stage=None, assignees=()):
+         values=None, body="", stage=None, assignees=(), project="PVT_1"):
     """Builds a ProjectV2Item node shaped like the GraphQL response."""
     field_values = [{"text": title, "field": {"name": "Title"}}, {}]
     if status:
@@ -62,7 +62,7 @@ def node(item_id, title, status=None, number=None, archived=False,
                    "title": title, "body": body, "number": number,
                    "url": f"https://github.com/octo/app/issues/{number}",
                    "assignees": {"nodes": [{"login": a} for a in assignees]}}
-    return {"id": item_id, "isArchived": archived,
+    return {"id": item_id, "isArchived": archived, "project": {"id": project},
             "fieldValues": {"nodes": field_values}, "content": content}
 
 
@@ -74,8 +74,16 @@ NODES = [
          assignees=["ann"]),
     node("PVTI_c", "Write release notes", "In progress", body="Draft body"),
     node("PVTI_e", "2026", "Backlog"),
+    # GitHub lists a freshly archived item only briefly; while it does, the
+    # board must still hide it.
     node("PVTI_f", "Old release plan", "Done", 14, archived=True),
+]
+
+# Reachable by node ID only: archived and no longer listed, or on another
+# project.
+UNLISTED = [
     node("PVTI_g", "Stale idea", archived=True),
+    node("PVTI_x", "Other board card", "Done", project="PVT_other"),
 ]
 
 
@@ -95,12 +103,12 @@ class FakeGh:
                              if not a.startswith("-") and "=" in a
                              and not a.startswith("query="))
             if "items(first" in query:
-                return self._page(variables)
+                return self._page(query, variables)
             if "repositoryOwner" in query:
                 return json.dumps({"data": {"repositoryOwner": {"projectV2": {
                     "id": "PVT_1", "fields": {"nodes": FIELDS}}}}})
             if "node(id:" in query:
-                found = next((n for n in self.nodes
+                found = next((n for n in self.nodes + UNLISTED
                               if n["id"] == variables["id"]), None)
                 return json.dumps({"data": {"node": found}})
         if args[:2] == ("api", "graphql"):
@@ -111,19 +119,20 @@ class FakeGh:
             return json.dumps({"id": "PVTI_new"})
         return ""
 
-    def _page(self, variables):
+    def _page(self, query, variables):
         cursor = variables.get("cursor", "null")
         start = 0 if cursor == "null" else int(cursor)
         chunk = self.nodes[start:start + self.page]
         more = start + self.page < len(self.nodes)
-        status = variables["status"]
-        options = next((f["options"] for f in FIELDS
-                        if f["name"].lower() == status.lower()), [])
-        project = {"field": {"options": [{"name": o["name"]}
-                                         for o in options]},
-                   "items": {"nodes": chunk, "pageInfo": {
+        project = {"items": {"nodes": chunk, "pageInfo": {
                        "hasNextPage": more,
                        "endCursor": str(start + self.page)}}}
+        if "field(name:" in query:
+            # Like GitHub, field(name:) matches the exact name only.
+            options = next((f["options"] for f in FIELDS
+                            if f["name"] == variables["status"]), [])
+            project["field"] = {"options": [{"name": o["name"]}
+                                            for o in options]}
         return json.dumps({"data": {"repositoryOwner": {
             "projectV2": project}}})
 
@@ -255,6 +264,21 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(board.BoardError):
             self.load()
 
+    def test_broken_lower_file_does_not_block_flags_or_env(self):
+        self.write(self.deep / ".project-board.json",
+                   {"owner": "o", "number": 1, "nubmer": 2})
+        (self.home / ".config" / "project-board" / "config.json").write_text(
+            "{not json")
+        cfg = self.load(flags={"owner": "f", "number": 7})
+        self.assertEqual((cfg.owner, cfg.number), ("f", 7))
+        cfg = self.load(env={"PROJECT_BOARD_OWNER": "e",
+                             "PROJECT_BOARD_NUMBER": "8"})
+        self.assertEqual((cfg.owner, cfg.number), ("e", 8))
+        # A good project file shields a broken user file, too.
+        self.write(self.deep / ".project-board.json",
+                   {"owner": "p", "number": 2})
+        self.assertEqual(self.load().owner, "p")
+
     def test_init_writes_loadable_file(self):
         args = board.build_parser().parse_args(
             ["init", "acme", "3", "--repo", "acme/web"])
@@ -275,9 +299,7 @@ class ItemsTest(BoardTestCase):
         ids = [i["id"] for i in self.board.items()]
         self.assertEqual(ids, ["PVTI_d", "PVTI_b", "PVTI_a", "PVTI_c",
                                "PVTI_e"])
-        self.assertEqual(len(self.fake.by_prefix("api", "graphql")), 3)
-        self.assertEqual([i["id"] for i in self.board.items(archived=True)],
-                         ["PVTI_f", "PVTI_g"])
+        self.assertEqual(len(self.fake.by_prefix("api", "graphql")), 2)
 
     def test_query_uses_owner_union_and_typed_variables(self):
         self.board.items(query="priority:P0")
@@ -304,14 +326,14 @@ class ItemsTest(BoardTestCase):
         self.assertIn("@ann", lines[0])
         self.assertEqual(lines[-1], "5 items")
 
-    def test_list_archived_and_status_filter(self):
-        out = self.run_cmd(["list", "--archived"])
-        self.assertIn("PVTI_f", out)
-        self.assertIn("PVTI_g", out)
-        self.assertNotIn("PVTI_a", out)
-        self.assertIn("2 archived items", out)
+    def test_list_status_filter(self):
         out = self.run_cmd(["list", "--status", "backlog"])
         self.assertEqual(out.count("PVTI_"), 2)
+
+    def test_list_has_no_archived_option(self):
+        with self.assertRaises(SystemExit), \
+                contextlib.redirect_stderr(io.StringIO()):
+            board.build_parser().parse_args(["list", "--archived"])
 
 
 class CustomStatusFieldTest(BoardTestCase):
@@ -321,8 +343,6 @@ class CustomStatusFieldTest(BoardTestCase):
         self.fake.nodes = [node("PVTI_x", "x", status="Done", stage="Shipped")]
         item = self.board.items()[0]
         self.assertEqual(item["status"], "Shipped")
-        args = self.fake.by_prefix("api", "graphql")[0]
-        self.assertIn("status=Stage", args)
 
     def test_move_uses_configured_field_and_prints_canonical_name(self):
         out = self.run_cmd(["move", "#12", "shipped"])
@@ -332,15 +352,44 @@ class CustomStatusFieldTest(BoardTestCase):
         self.assertEqual(out.strip(), "Fix login bug: - -> Shipped")
 
 
+class LowercaseStatusFieldTest(BoardTestCase):
+    status_field = "status"
+
+    def test_list_still_sorts_by_column_order(self):
+        lines = self.run_cmd(["list"]).splitlines()
+        self.assertEqual([line.split("[")[-1].rstrip("]") for line in
+                          lines[:-1]],
+                         ["PVTI_a", "PVTI_e", "PVTI_c", "PVTI_b", "PVTI_d"])
+
+    def test_set_prints_board_spelling_of_field(self):
+        out = self.run_cmd(["set", "PVTI_a", "target DATE", "2026-12-24"])
+        self.assertEqual(out.strip(),
+                         "Fix login bug: Target date = '2026-12-24'")
+
+
 class ResolveTest(BoardTestCase):
 
-    def test_node_id_uses_one_query_and_no_listing(self):
+    def test_node_id_uses_small_queries_and_no_listing(self):
         item = self.board.resolve("PVTI_a")
         self.assertEqual((item["id"], item["title"], item["status"]),
                          ("PVTI_a", "Fix login bug", "Backlog"))
         self.assertEqual(item["fields"]["Estimate"], 3)
-        self.assertEqual(len(self.fake.calls), 1)
-        self.assertNotIn("items(first", self.fake.graphql_queries()[0])
+        queries = self.fake.graphql_queries()
+        self.assertEqual(len(queries), 2)     # the item, the project's ID
+        self.assertFalse(any("items(first" in q for q in queries))
+
+    def test_node_id_of_other_project_is_refused(self):
+        with self.assertRaises(board.BoardError) as ctx:
+            self.board.resolve("PVTI_x")
+        self.assertIn("another project", str(ctx.exception))
+
+    def test_archived_node_id_is_refused_outside_undo(self):
+        for argv in (["show", "PVTI_g"], ["move", "PVTI_g", "Done"],
+                     ["delete", "PVTI_g"], ["archive", "PVTI_g"]):
+            with self.assertRaises(board.BoardError, msg=argv) as ctx:
+                self.run_cmd(argv)
+            self.assertIn("--undo", str(ctx.exception))
+        self.assertEqual(self.fake.by_prefix("project"), [])
 
     def test_unknown_node_id(self):
         with self.assertRaises(board.BoardError):
@@ -372,8 +421,6 @@ class ResolveTest(BoardTestCase):
         for ref in ("Old release plan", "#14", "stale"):
             with self.assertRaises(board.BoardError, msg=ref):
                 self.board.resolve(ref)
-        self.assertEqual(self.board.resolve("old release",
-                                            archived=True)["id"], "PVTI_f")
 
 
 class ShowTest(BoardTestCase):
@@ -504,22 +551,36 @@ class WriteCommandsTest(BoardTestCase):
                            "--format", "json")])
         self.assertEqual(self.fake.by_prefix("project", "item-edit"), [])
 
-    def test_archive_and_undo(self):
-        self.run_cmd(["archive", "release notes"])
-        self.run_cmd(["archive", "old release", "--undo"])
+    def test_bad_status_creates_nothing(self):
+        for argv in (["create", "New card", "--status", "Nope"],
+                     ["create", "Bug", "--issue", "--status", "Nope"],
+                     ["add", "https://github.com/octo/app/issues/5",
+                      "--status", "Nope"]):
+            with self.assertRaises(board.BoardError, msg=argv):
+                self.run_cmd(argv)
+        self.assertEqual(self.fake.by_prefix("project", "item-create"), [])
+        self.assertEqual(self.fake.by_prefix("project", "item-add"), [])
+        self.assertEqual(self.fake.by_prefix("issue"), [])
+
+    def test_archive_by_title_and_undo_by_node_id(self):
+        out = self.run_cmd(["archive", "release notes"])
+        self.assertIn("[PVTI_c]", out)
         self.run_cmd(["archive", "PVTI_g", "--undo"])
         self.assertEqual(self.fake.by_prefix("project", "item-archive"), [
             ("project", "item-archive", "7", "--owner", "octo",
              "--id", "PVTI_c"),
             ("project", "item-archive", "7", "--owner", "octo",
-             "--id", "PVTI_f", "--undo"),
-            ("project", "item-archive", "7", "--owner", "octo",
              "--id", "PVTI_g", "--undo"),
         ])
 
-    def test_undo_does_not_match_current_items(self):
-        with self.assertRaises(board.BoardError):
-            self.run_cmd(["archive", "release notes", "--undo"])
+    def test_undo_needs_archived_node_id(self):
+        with self.assertRaises(board.BoardError) as ctx:
+            self.run_cmd(["archive", "Stale idea", "--undo"])
+        self.assertIn("PVTI_", str(ctx.exception))
+        for ref in ("PVTI_c", "PVTI_x"):    # not archived; other project
+            with self.assertRaises(board.BoardError, msg=ref):
+                self.run_cmd(["archive", ref, "--undo"])
+        self.assertEqual(self.fake.by_prefix("project", "item-archive"), [])
 
     def test_delete(self):
         out = self.run_cmd(["delete", "#13"])

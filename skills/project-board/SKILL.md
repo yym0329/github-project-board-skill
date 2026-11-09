@@ -13,24 +13,25 @@ project, field and option ID for you. It needs Python 3.9+ (stdlib only) and
 B="<skill-dir>/board.py"                # the directory holding this SKILL.md
 python3 $B fields                       # fields, types and options
 python3 $B list [--status "In progress"] [--query "priority:P0 -status:Done"]
-python3 $B list --archived              # archived cards only
 python3 $B show <item>                  # all field values, URL and body
 python3 $B create "Title" [--body "..."] [--status Backlog] [--issue]
 python3 $B add <issue-or-PR-URL> [--status "In review"]
 python3 $B move <item> Done
 python3 $B set <item> <Field> <value>   # single select, text, number, date, iteration; '' clears
 python3 $B edit <item> [--title ...] [--body ...]   # drafts only
-python3 $B archive <item>
-python3 $B archive <item> --undo        # matches archived cards only
+python3 $B archive <item>               # prints the PVTI_ ID
+python3 $B archive <PVTI_id> --undo     # archived cards can't be listed; keep the ID
 python3 $B delete <item>
 python3 $B options <Field> [--add X] [--rename Old=New] [--remove X] [--order A,B,C] [--apply]
 ```
 
 `<item>` is a `PVTI_...` node ID, an issue or PR number (`#12` or `12`), or
 a title substring that matches exactly one card (an exact title match wins;
-a number that matches no issue or PR is tried as a title). Archived cards are
-skipped, except by `list --archived` and `archive --undo`. On several matches
-the helper lists them and stops; then use the node ID.
+a number that matches no issue or PR is tried as a title). Archived cards and
+cards of other projects are refused, except that `archive --undo` takes an
+archived card's node ID. On several matches the helper lists them and stops;
+then use the node ID. GitHub's listing can trail a change by about a minute,
+so right after a change refer to the card by the ID the helper printed.
 
 ## Configuration
 
